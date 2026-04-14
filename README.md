@@ -1,6 +1,6 @@
 # ootf_ros2
 
-A ROS2-based pipeline for controlling a Doosan H2017 robot arm in NVIDIA Isaac Sim via TCP commands. Robot joint positions are received over TCP, validated, forwarded to a ROS2 topic, and applied to a physics simulation in real time.
+A ROS2-based pipeline for controlling a Doosan H2017 robot arm in NVIDIA Isaac Sim via TCP commands. Robot joint positions are received over TCP, validated, and published directly to a ROS2 topic, then applied to a physics simulation in real time.
 
 ---
 
@@ -10,13 +10,10 @@ A ROS2-based pipeline for controlling a Doosan H2017 robot arm in NVIDIA Isaac S
 TCP Client
     │
     ▼
-receiver.py         — Validates incoming TCP messages, parses joint positions
-    │
-    ▼ (JSON over TCP)
-ros_publisher.py    — Publishes joint positions to /joint_command (ROS2)
+tcp_ros_bridge.py   — Validates and parses TCP messages, publishes to /joint_command
     │
     ▼ (/joint_command)
-test.py             — Isaac Sim simulation, applies positions to robot joints
+simulation.py       — Isaac Sim simulation, applies joint positions to robot
     │
     ▼ (/joint_states)
 Any ROS2 subscriber — Live joint state feedback from the simulation
@@ -47,8 +44,7 @@ No additional pip installs are required. All dependencies are either built into 
 ootf_ros2/
 ├── launch/
 │   ├── launch_isaacsim.sh      # Start Isaac Sim with the robot
-│   ├── launch_publisher.sh     # Start the ROS2 joint command publisher
-│   └── launch_receiver.sh      # Start the TCP receiver
+│   └── launch_bridge.sh        # Start the TCP/ROS2 bridge
 ├── scenes/
 │   └── h2017/
 │       ├── h2017.urdf          # Doosan H2017 robot description
@@ -56,8 +52,7 @@ ootf_ros2/
 │       └── meshes_collision/   # Collision mesh files (.dae)
 └── src/
     ├── simulation.py           # Isaac Sim simulation entry point
-    ├── ros_publisher.py        # ROS2 publisher node
-    └── receiver.py             # TCP server and message validator
+    └── tcp_ros_bridge.py       # Combined TCP receiver and ROS2 publisher
 ```
 
 ---
@@ -92,22 +87,17 @@ Example:
 
 ## Usage
 
-Open three terminals from the project root and run each launch script in order.
+Open two terminals and run each launch script in order.
 
 **Terminal 1 — Isaac Sim**
 ```bash
 bash launch/launch_isaacsim.sh
 ```
-Wait until the Isaac Sim viewport is fully loaded before starting the other terminals.
+Wait until the Isaac Sim viewport is fully loaded before starting the bridge.
 
-**Terminal 2 — ROS2 Publisher**
+**Terminal 2 — TCP/ROS2 Bridge**
 ```bash
-bash launch/launch_publisher.sh
-```
-
-**Terminal 3 — TCP Receiver**
-```bash
-bash launch/launch_receiver.sh
+bash launch/launch_bridge.sh
 ```
 
 Then connect a TCP client to port `9000` on the machine's IP and start sending commands in the format described above.
