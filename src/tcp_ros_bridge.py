@@ -106,7 +106,7 @@ def main():
                 while True:
                     data = conn.recv(1024)
                     if not data:
-                        print("Client broke connection, closing connection...")
+                        print("Sad to see you go, closing connection...")
                         break
 
                     message = data.decode('utf-8').strip()
