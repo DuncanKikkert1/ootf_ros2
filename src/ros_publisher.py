@@ -1,7 +1,8 @@
 # =============================================================================
 # Name        : ros_publisher.py
 # Author      : Duncan Kikkert
-# Date        : 13/4/2026
+# Created     : 13/4/2026
+# Last update : 14/4/2026
 # Version     : 1.1
 # Description : Receives parsed TCP messages forwarded by receiver.py and
 #               publishes them to a ROS2 topic as a sensor_msgs/JointState message.

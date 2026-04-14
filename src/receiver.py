@@ -1,14 +1,15 @@
 # =============================================================================
 # Name        : receiver.py
 # Author      : Duncan Kikkert
-# Last Update : 13/4/2026
+# Created     : 13/4/2026
+# Last Update : 14/4/2026
 # Version     : 1.0
 # Description : TCP server that receives and validates messages from a TCP client. 
 #               Parses valid messages into named variables according to 
 #               standard Affix format.
 #
 # Message format : key_cmd;status;extra_num;gripper;x;y;z;aw;ap;ar
-# Example        : 250;254;175;0;570;-425;750;0;-180;0
+# Example        : 250;254;0;0;1.57;0;1.57;1.57;-1.57;0
 #
 # Dependencies : socket, re (both built-in, no install required)
 # Usage        : Run this script on the Ubuntu PC, then connect TCP client
