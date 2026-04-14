@@ -26,7 +26,10 @@ from isaacsim.core.api import World
 from isaacsim.core.api.robots import Robot
 from isaacsim.core.utils.extensions import enable_extension
 from isaacsim.core.utils.types import ArticulationAction
+from isaacsim.core.utils.stage import add_reference_to_stage
 from isaacsim.asset.importer.urdf import _urdf
+from pxr import UsdGeom, UsdLux, UsdShade, Sdf, Gf
+import omni.usd
 
 # Enable ROS2 bridge before setting up the world
 enable_extension("isaacsim.ros2.bridge")
@@ -68,6 +71,46 @@ class RobotROSNode(Node):
 # -----------------------------------------------------------------------------
 world = World(physics_dt=1.0 / 60.0, rendering_dt=1.0 / 60.0, stage_units_in_meters=1.0)
 world.scene.add_default_ground_plane()
+
+stage = omni.usd.get_context().get_stage()
+
+# -----------------------------------------------------------------------------
+# Lighting — dome light for uniform ambient light with no shadows
+# -----------------------------------------------------------------------------
+dome_light = UsdLux.DomeLight.Define(stage, "/World/DomeLight")
+dome_light.CreateIntensityAttr(300.0)
+dome_light.CreateColorAttr(Gf.Vec3f(1.0, 1.0, 1.0))
+dome_light.GetPrim().CreateAttribute("inputs:shadow:enable", Sdf.ValueTypeNames.Bool).Set(False)
+
+# -----------------------------------------------------------------------------
+# Ground — light grey material applied to default ground plane
+# -----------------------------------------------------------------------------
+mat = UsdShade.Material.Define(stage, "/World/GroundMaterial")
+shader = UsdShade.Shader.Define(stage, "/World/GroundMaterial/Shader")
+shader.CreateIdAttr("UsdPreviewSurface")
+shader.CreateInput("diffuseColor", Sdf.ValueTypeNames.Color3f).Set(Gf.Vec3f(0.85, 0.85, 0.85))
+shader.CreateInput("roughness",    Sdf.ValueTypeNames.Float).Set(0.9)
+mat.CreateSurfaceOutput().ConnectToSource(shader.ConnectableAPI(), "surface")
+ground = stage.GetPrimAtPath("/World/defaultGroundPlane")
+UsdShade.MaterialBindingAPI(ground).Bind(mat)
+
+# -----------------------------------------------------------------------------
+# Scene assets — 3 stacked pallets
+# -----------------------------------------------------------------------------
+PALLET_URL    = "https://omniverse-content-production.s3-us-west-2.amazonaws.com/Assets/Isaac/5.1/Isaac/Props/Pallet/pallet.usd"
+PALLET_HEIGHT = 0.144  # metres — adjust if pallets overlap or gap after loading
+
+# Rotations per pallet — alternating 0°/90° for realistic stacking
+PALLET_ROTATIONS = [89.5, 90.7, 90.0]
+
+for i in range(3):
+    prim_path = f"/World/Pallet_{i}"
+    add_reference_to_stage(usd_path=PALLET_URL, prim_path=prim_path)
+    xform = UsdGeom.Xformable(stage.GetPrimAtPath(prim_path))
+    xform.ClearXformOpOrder()
+    xform.AddTranslateOp().Set(Gf.Vec3d(1.0, 0.0, PALLET_HEIGHT * i))
+    xform.AddRotateXYZOp().Set(Gf.Vec3f(0.0, 0.0, PALLET_ROTATIONS[i]))
+    xform.AddScaleOp().Set(Gf.Vec3f(1.0, 1.0, 1.0))
 
 # -----------------------------------------------------------------------------
 # URDF import configuration
