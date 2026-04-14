@@ -17,6 +17,7 @@
 
 import socket
 import re
+import json
 
 HOST = '0.0.0.0'
 PORT = 9000
@@ -66,14 +67,15 @@ def parse_message(message):
 
 # -----------------------------------------------------------------------------
 # forward_message()
-# Opens a short-lived connection to ros_publisher.py and sends the raw message
+# Opens a short-lived connection to ros_publisher.py and sends the parsed
+# message as a JSON-encoded string so ros_publisher.py can access named fields.
 # -----------------------------------------------------------------------------
-def forward_message(message):
+def forward_message(parsed):
     try:
         with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as fwd:
             fwd.connect((FORWARD_HOST, FORWARD_PORT))
-            fwd.sendall(message.encode('utf-8'))
-            print(f"Forwarded to ROS publisher: {message}")
+            fwd.sendall(json.dumps(parsed).encode('utf-8'))
+            print(f"Forwarded to ROS publisher: {parsed}")
     except ConnectionRefusedError:
         print("ROS publisher not reachable — is ros_publisher.py running?")
     except Exception as e:
@@ -113,9 +115,18 @@ with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
                     print(f"  aw        : {parsed['aw']} deg")
                     print(f"  ap        : {parsed['ap']} deg")
                     print(f"  ar        : {parsed['ar']} deg")
-                    forward_message(message=message)
+                    forward_message(parsed=parsed)
                 else:
-                    print(f"Invalid message rejected: {message}")
+                    fields = message.split(';')
+                    if len(fields) != 10:
+                        print(f"Invalid message rejected: expected 10 fields, got {len(fields)}: {message}")
+                    else:
+                        for name, value in zip(
+                            ['key_cmd', 'status', 'extra_num', 'gripper', 'x', 'y', 'z', 'aw', 'ap', 'ar'],
+                            fields
+                        ):
+                            if not re.fullmatch(r'\d+' if name in ('key_cmd', 'status', 'extra_num') else r'[+\-]?\d+(\.\d+)?', value):
+                                print(f"Invalid message rejected: field '{name}' has invalid value '{value}'")
                     
     except KeyboardInterrupt:
         print("\nShutting down cleanly...")
