@@ -1,11 +1,17 @@
-###
-# This script imports a URDF robot into Isaac Sim, sets up the world and
-# physics, configures joint drive gains, and runs the simulation loop.
-# ROS2 joint commands received on /joint_command are applied to the robot.
+# =============================================================================
+# Name        : simulation.py
+# Author      : Duncan Kikkert
+# Created     : 14/4/2026
+# Last Update : 14/4/2026
+# Version     : 1.0
+# Description : Isaac Sim entry point. Imports the H2017 robot from URDF,
+#               sets up the physics world, and runs the simulation loop.
+#               Subscribes to /joint_command to move the robot and publishes
+#               live joint states to /joint_states.
 #
-# Place your robot's .urdf file in scenes/<robot>/ before running.
-# Run with: bash launch/launch_isaacsim.sh
-###
+# Dependencies : Isaac Sim (Python 3.11), ROS2 Jazzy, rclpy, sensor_msgs
+# Usage        : bash launch/launch_isaacsim.sh
+# =============================================================================
 
 from pathlib import Path
 from isaacsim import SimulationApp
