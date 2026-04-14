@@ -9,13 +9,13 @@
 				<collision>
 					<origin rpy="0 0 0" xyz="0 0 0" />
 					<geometry>
-						<mesh filename="h2017_collision/H2017_0_0.dae" scale="0.001 0.001 0.001" />
+						<mesh filename="meshes_collision/H2017_0_0.dae" scale="0.001 0.001 0.001" />
 					</geometry>
 				</collision>
 				<visual>
 					<origin rpy="0 0 0" xyz="0 0 0" />
 					<geometry>
-						<mesh filename="h2017_white/H2017_0_0.dae" scale="0.001 0.001 0.001" />
+						<mesh filename="meshes_white/H2017_0_0.dae" scale="0.001 0.001 0.001" />
 					</geometry>
 				</visual>
 			</link>
@@ -43,13 +43,13 @@
             <collision>
 				<origin rpy="0 0 0" xyz="0 0 0" />
 				<geometry>
-					<mesh filename="h2017_collision/H2017_1_0.dae" scale="0.001 0.001 0.001" />
+					<mesh filename="meshes_collision/H2017_1_0.dae" scale="0.001 0.001 0.001" />
 				</geometry>
 			</collision>
 			<visual>
 				<origin rpy="0 0 0" xyz="0 0 0" />
 				<geometry>
-					<mesh filename="h2017_white/H2017_1_0.dae" scale="0.001 0.001 0.001" />
+					<mesh filename="meshes_white/H2017_1_0.dae" scale="0.001 0.001 0.001" />
 				</geometry>
 			</visual>
 		</link>
@@ -71,37 +71,37 @@
             <collision>
 				<origin rpy="0 0 0" xyz="0 0 0" />
 				<geometry>
-					<mesh filename="h2017_collision/H2017_2_0.dae" scale="0.001 0.001 0.001" />
+					<mesh filename="meshes_collision/H2017_2_0.dae" scale="0.001 0.001 0.001" />
 				</geometry>
 			</collision>
 			<visual>
 				<origin rpy="0 0 0" xyz="0 0 0" />
 				<geometry>
-					<mesh filename="h2017_white/H2017_2_0.dae" scale="0.001 0.001 0.001" />
+					<mesh filename="meshes_white/H2017_2_0.dae" scale="0.001 0.001 0.001" />
 				</geometry>
 			</visual>
 			<collision>
 				<origin rpy="0 0 0" xyz="0 0 0" />
 				<geometry>
-					<mesh filename="h2017_collision/H2017_2_1.dae" scale="0.001 0.001 0.001" />
+					<mesh filename="meshes_collision/H2017_2_1.dae" scale="0.001 0.001 0.001" />
 				</geometry>
 			</collision>
 			<visual>
 				<origin rpy="0 0 0" xyz="0 0 0" />
 				<geometry>
-					<mesh filename="h2017_white/H2017_2_1.dae" scale="0.001 0.001 0.001" />
+					<mesh filename="meshes_white/H2017_2_1.dae" scale="0.001 0.001 0.001" />
 				</geometry>
 			</visual>
 			<collision>
 				<origin rpy="0 0 0" xyz="0 0 0" />
 				<geometry>
-					<mesh filename="h2017_collision/H2017_2_2.dae" scale="0.001 0.001 0.001" />
+					<mesh filename="meshes_collision/H2017_2_2.dae" scale="0.001 0.001 0.001" />
 				</geometry>
 			</collision>
 			<visual>
 				<origin rpy="0 0 0" xyz="0 0 0" />
 				<geometry>
-					<mesh filename="h2017_white/H2017_2_2.dae" scale="0.001 0.001 0.001" />
+					<mesh filename="meshes_white/H2017_2_2.dae" scale="0.001 0.001 0.001" />
 				</geometry>
 			</visual>
 		</link>
@@ -123,13 +123,13 @@
 			<collision>
 				<origin rpy="0 0 0" xyz="0 0 0" />
 				<geometry>
-					<mesh filename="h2017_collision/H2017_3_0.dae" scale="0.001 0.001 0.001" />
+					<mesh filename="meshes_collision/H2017_3_0.dae" scale="0.001 0.001 0.001" />
 				</geometry>
 			</collision>
             <visual>
 				<origin rpy="0 0 0" xyz="0 0 0" />
 				<geometry>
-					<mesh filename="h2017_white/H2017_3_0.dae" scale="0.001 0.001 0.001" />
+					<mesh filename="meshes_white/H2017_3_0.dae" scale="0.001 0.001 0.001" />
 				</geometry>
 			</visual>
 		</link>
@@ -151,25 +151,25 @@
             <collision>
 				<origin rpy="0 0 0" xyz="0 0 0" />
 				<geometry>
-					<mesh filename="h2017_collision/H2017_4_0.dae" scale="0.001 0.001 0.001" />
+					<mesh filename="meshes_collision/H2017_4_0.dae" scale="0.001 0.001 0.001" />
 				</geometry>
 			</collision>
 			<visual>
 				<origin rpy="0 0 0" xyz="0 0 0" />
 				<geometry>
-					<mesh filename="h2017_white/H2017_4_0.dae" scale="0.001 0.001 0.001" />
+					<mesh filename="meshes_white/H2017_4_0.dae" scale="0.001 0.001 0.001" />
 				</geometry>
 			</visual>
 			<collision>
 				<origin rpy="0 0 0" xyz="0 0 0" />
 				<geometry>
-					<mesh filename="h2017_collision/H2017_4_1.dae" scale="0.001 0.001 0.001" />
+					<mesh filename="meshes_collision/H2017_4_1.dae" scale="0.001 0.001 0.001" />
 				</geometry>
 			</collision>
 			<visual>
 				<origin rpy="0 0 0" xyz="0 0 0" />
 				<geometry>
-					<mesh filename="h2017_white/H2017_4_1.dae" scale="0.001 0.001 0.001" />
+					<mesh filename="meshes_white/H2017_4_1.dae" scale="0.001 0.001 0.001" />
 				</geometry>
 			</visual>
 		</link>
@@ -191,13 +191,13 @@
             <collision>
 				<origin rpy="0 0 0" xyz="0 0 0" />
 				<geometry>
-					<mesh filename="h2017_collision/H2017_5_0.dae" scale="0.001 0.001 0.001" />
+					<mesh filename="meshes_collision/H2017_5_0.dae" scale="0.001 0.001 0.001" />
 				</geometry>
 			</collision>
 			<visual>
 				<origin rpy="0 0 0" xyz="0 0 0" />
 				<geometry>
-					<mesh filename="h2017_white/H2017_5_0.dae" scale="0.001 0.001 0.001" />
+					<mesh filename="meshes_white/H2017_5_0.dae" scale="0.001 0.001 0.001" />
 				</geometry>
 			</visual>
 		</link>
@@ -219,13 +219,13 @@
 			<collision>
 				<origin rpy="0 0 0" xyz="0 0 0" />
 				<geometry>
-					<mesh filename="h2017_collision/H2017_6_0.dae" scale="0.001 0.001 0.001" />
+					<mesh filename="meshes_collision/H2017_6_0.dae" scale="0.001 0.001 0.001" />
 				</geometry>
 			</collision>
 			<visual>
 				<origin rpy="0 0 0" xyz="0 0 0" />
 				<geometry>
-					<mesh filename="h2017_white/H2017_6_0.dae" scale="0.001 0.001 0.001" />
+					<mesh filename="meshes_white/H2017_6_0.dae" scale="0.001 0.001 0.001" />
 				</geometry>
 			</visual>
 		</link>

@@ -50,11 +50,12 @@ ootf_ros2/
 │   ├── launch_publisher.sh     # Start the ROS2 joint command publisher
 │   └── launch_receiver.sh      # Start the TCP receiver
 ├── scenes/
-│   ├── h2017.urdf              # Doosan H2017 robot description
-│   ├── h2017_white/            # Visual mesh files (.dae)
-│   └── h2017_collision/        # Collision mesh files (.dae)
-└── src/scripts/
-    ├── test.py                 # Isaac Sim simulation entry point
+│   └── h2017/
+│       ├── h2017.urdf          # Doosan H2017 robot description
+│       ├── meshes_white/       # Visual mesh files (.dae)
+│       └── meshes_collision/   # Collision mesh files (.dae)
+└── src/
+    ├── simulation.py           # Isaac Sim simulation entry point
     ├── ros_publisher.py        # ROS2 publisher node
     └── receiver.py             # TCP server and message validator
 ```

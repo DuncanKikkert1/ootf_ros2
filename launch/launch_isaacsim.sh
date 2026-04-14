@@ -23,4 +23,4 @@ export PYTHONPATH=$ISAAC_BRIDGE/rclpy:$PYTHONPATH
 # Python environment
 source "$PYENV_PYTHON"
 
-python3 "$PROJECT_ROOT/src/scripts/test.py"
+python3 "$PROJECT_ROOT/src/simulation.py"

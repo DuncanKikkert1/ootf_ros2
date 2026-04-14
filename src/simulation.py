@@ -3,8 +3,8 @@
 # physics, configures joint drive gains, and runs the simulation loop.
 # ROS2 joint commands received on /joint_command are applied to the robot.
 #
-# Place your robot's .urdf file in the scenes/ folder before running.
-# Run with: bash launch.sh
+# Place your robot's .urdf file in scenes/<robot>/ before running.
+# Run with: bash launch/launch_isaacsim.sh
 ###
 
 from pathlib import Path
@@ -28,8 +28,9 @@ enable_extension("isaacsim.ros2.bridge")
 # -----------------------------------------------------------------------------
 # Paths
 # -----------------------------------------------------------------------------
-SCENES_DIR = Path(__file__).parent.parent.parent / "scenes"
-URDF_PATH  = SCENES_DIR / "h2017.urdf"
+SCENES_DIR = Path(__file__).parent.parent / "scenes"
+ROBOT_DIR  = SCENES_DIR / "h2017"
+URDF_PATH  = ROBOT_DIR / "h2017.urdf"
 
 # -----------------------------------------------------------------------------
 # ROS2 subscriber node
@@ -76,8 +77,8 @@ import_config.default_drive_strength         = 1e6
 import_config.default_position_drive_damping = 1e5
 
 # Parse and import the URDF into the active stage
-robot_urdf = urdf_interface.parse_urdf(str(SCENES_DIR), URDF_PATH.name, import_config)
-prim_path  = urdf_interface.import_robot(str(SCENES_DIR), URDF_PATH.name, robot_urdf, import_config)
+robot_urdf = urdf_interface.parse_urdf(str(ROBOT_DIR), URDF_PATH.name, import_config)
+prim_path  = urdf_interface.import_robot(str(ROBOT_DIR), URDF_PATH.name, robot_urdf, import_config)
 
 if not prim_path:
     raise RuntimeError(f"Failed to import URDF from {URDF_PATH}")

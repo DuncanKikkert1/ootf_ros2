@@ -19,4 +19,4 @@ export PYTHONPATH=$ISAAC_BRIDGE/rclpy:$PYTHONPATH
 
 source "$PYENV_PYTHON"
 
-python3 "$PROJECT_ROOT/src/scripts/ros_publisher.py"
+python3 "$PROJECT_ROOT/src/ros_publisher.py"

@@ -6,4 +6,4 @@
 
 PROJECT_ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 
-python3 "$PROJECT_ROOT/src/scripts/receiver.py"
+python3 "$PROJECT_ROOT/src/receiver.py"
