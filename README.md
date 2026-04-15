@@ -21,20 +21,38 @@ Any ROS2 subscriber — Live joint state feedback from the simulation
 
 ---
 
-## Dependencies
+## Installation
 
-### System
-- Ubuntu 24.04
-- [NVIDIA Isaac Sim](https://developer.nvidia.com/isaac-sim) (Python 3.11, via pyenv)
-- ROS2 Jazzy
-- [Isaac Sim ROS2 Workspace](https://github.com/isaac-sim/IsaacSim-ros_workspaces)
+### 1. System requirements
+- Ubuntu 22.04 or 24.04
+- ROS2 (Humble for Ubuntu 22.04, Jazzy for Ubuntu 24.04)
+- Python 3.11
 
-### Python
-- `rclpy` (provided by Isaac Sim's internal ROS2 bridge)
-- `sensor_msgs` (provided by Isaac Sim's internal ROS2 bridge)
-- `isaacsim` (installed in pyenv environment)
+### 2. Install ROS2
+Follow the official guide for your distro:
+- [ROS2 Humble (Ubuntu 22.04)](https://docs.ros.org/en/humble/Installation/Ubuntu-Install-Debs.html)
+- [ROS2 Jazzy (Ubuntu 24.04)](https://docs.ros.org/en/jazzy/Installation/Ubuntu-Install-Debs.html)
 
-No additional pip installs are required. All dependencies are either built into Isaac Sim or provided by the ROS2 workspace.
+### 3. Install NVIDIA Isaac Sim
+Install via pip into a Python 3.11 environment:
+```bash
+pip install isaacsim --extra-index-url https://pypi.nvidia.com
+pip install isaacsim-rl isaacsim-replicator isaacsim-extscache-physics isaacsim-extscache-kit isaacsim-extscache-kit-sdk --extra-index-url https://pypi.nvidia.com
+```
+
+### 4. Set up the Isaac Sim ROS2 workspace
+Clone and build the Isaac Sim ROS2 workspace for your distro:
+```bash
+git clone https://github.com/isaac-sim/IsaacSim-ros_workspaces.git ~/IsaacSim-ros_workspaces
+cd ~/IsaacSim-ros_workspaces
+# Follow the build instructions in that repo for your ROS2 distro
+```
+
+### 5. Clone this repository
+```bash
+git clone https://github.com/DuncanKikkert1/ootf_ros2.git
+cd ootf_ros2
+```
 
 ---
 
@@ -87,7 +105,12 @@ Example:
 
 ## Usage
 
-Open two terminals and run each launch script in order.
+The launch scripts auto-detect your ROS2 distro, Python environment, and Isaac Sim paths. If your Isaac Sim ROS2 workspace is in a non-standard location, set `ISAAC_WS` before running:
+```bash
+ISAAC_WS=/path/to/workspace bash launch/launch_isaacsim.sh
+```
+
+Open two terminals from the project root and run in order:
 
 **Terminal 1 — Isaac Sim**
 ```bash
