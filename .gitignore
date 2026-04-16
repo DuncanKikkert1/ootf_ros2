@@ -27,6 +27,9 @@ _build/
 *.bak
 
 
+# VLA demos / training data
+octo_vla/Demos/
+
 # OS
 .DS_Store
 Thumbs.db

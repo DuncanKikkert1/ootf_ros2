@@ -1,8 +1,8 @@
 # =============================================================================
 # Name        : joint_service_client.py
 # Author      : Duncan Kikkert
-# Created     : 14/4/2026
-# Last Update : 14/4/2026
+# Created     : 15/4/2026
+# Last Update : 15/4/2026
 # Version     : 1.0
 # Description : Subscribes to /joint_command and forwards joint positions to
 #               the Doosan MoveJoint ROS2 service. Joint positions are

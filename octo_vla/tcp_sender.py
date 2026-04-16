@@ -1,0 +1,73 @@
+# =============================================================================
+# Name        : tcp_sender.py
+# Author      : Duncan Kikkert
+# Created     : 16/4/2026
+# Description : Persistent TCP client that sends EEF delta actions to a
+#               receiver (tcp_receiver.py or a downstream robot bridge).
+#
+# Message format (newline-terminated, 7 semicolon-separated floats):
+#   dx;dy;dz;drx;dry;drz;gripper\n
+#
+# Example:
+#   0.001234;-0.000567;0.002100;0.000100;-0.000050;0.000300;0.450000
+#
+# Usage:
+#   with EEFDeltaSender('127.0.0.1', 9001) as sender:
+#       sender.send(action)
+# =============================================================================
+
+import socket
+
+
+class EEFDeltaSender:
+    """Persistent TCP connection for sending 7-DOF EEF delta actions."""
+
+    FIELDS = ["dx", "dy", "dz", "drx", "dry", "drz", "gripper"]
+
+    # def __init__(self, host: str = "127.0.0.1", port: int = 9001): # For local
+    def __init__(self, host: str = "192.168.1.244", port: int = 9005): # For laptop Duncan
+        self.host  = host
+        self.port  = port
+        self._sock = None
+
+    # ------------------------------------------------------------------
+    # Connection management
+    # ------------------------------------------------------------------
+
+    def connect(self):
+        self._sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        self._sock.connect((self.host, self.port))
+        print(f"[TCP] Connected to {self.host}:{self.port}")
+
+    def close(self):
+        if self._sock:
+            self._sock.close()
+            self._sock = None
+            print("[TCP] Connection closed.")
+
+    def __enter__(self):
+        self.connect()
+        return self
+
+    def __exit__(self, *_):
+        self.close()
+
+    # ------------------------------------------------------------------
+    # Sending
+    # ------------------------------------------------------------------
+
+    def send(self, action):
+        """Send a 7-value EEF delta action.
+
+        Args:
+            action: array-like of length 7 — [dx, dy, dz, drx, dry, drz, gripper]
+        """
+        if self._sock is None:
+            raise RuntimeError("Not connected. Call connect() or use as a context manager.")
+
+        action = list(action)
+        if len(action) != 7:
+            raise ValueError(f"Expected 7 action values, got {len(action)}.")
+
+        msg = ";".join(f"{v:.6f}" for v in action) + "\n"
+        self._sock.sendall(msg.encode("utf-8"))
