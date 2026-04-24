@@ -124,10 +124,12 @@ ootf_ros2/
 │   ├── mech_eye_camera.py      # MechEye 3D camera interface
 │   └── tcp_sender.py           # Sends EEF delta actions over TCP
 ├── scenes/
+│   ├── usd/
+│   │   └── doosan_BIC.usd      # Pre-built Isaac Sim scene (loaded by simulation.py)
 │   └── h2017/
-│       ├── h2017.urdf          # Doosan H2017 robot description
-│       ├── meshes_white/       # Visual mesh files (.dae)
-│       └── meshes_collision/   # Collision mesh files (.dae)
+│       └── urdf/
+│           ├── h2017.urdf      # Doosan H2017 URDF robot description (used by LULA IK)
+│           └── h2017_lula.yaml # LULA kinematics config (auto-generated on first run)
 └── src/
     ├── tcp_ros_bridge.py       # TCP receiver and ROS2 publisher
     ├── joint_service_client.py # Forwards joint commands to Doosan MoveJoint service
