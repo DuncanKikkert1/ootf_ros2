@@ -1,259 +1,272 @@
 # ootf_ros2
 
-A ROS2-based pipeline for controlling a Doosan H2017 robot arm using the Octo Vision-Language-Action (VLA) model. Supports three modes: virtual (Isaac Sim), real (physical robot), and end-to-end (Octo VLA inference driving the real robot over TCP).
+A ROS2 pipeline for training and deploying a Doosan H2017 robot arm using the
+[Octo](https://github.com/octo-models/octo) Vision-Language-Action (VLA) model.
+Synthetic demonstrations are collected in Isaac Sim, used to finetune Octo, and
+the resulting policy drives the robot in simulation or on the real hardware.
 
 ---
 
 ## Architecture
 
-**Virtual mode** (Isaac Sim):
+### Data collection & training
+
 ```
-tcp_ros_bridge.py   — Listens on TCP port 9000, publishes to /joint_command
-    │
-    ▼ (/joint_command)
-simulation.py       — Isaac Sim simulation, applies joint positions to robot
-    │
-    ▼ (/joint_states)
-Any ROS2 subscriber — Live joint state feedback
+Isaac Sim (headless)
+  └─ collect.py          Scripted pick-and-place with Replicator domain randomisation
+       │  saves .npz episodes  (images, actions, instruction)
+       ▼
+  tfds_builder.py        Converts .npz → TFDS dataset  (ootf_synthetic)
+       │
+       ▼
+  Octo finetune          head_only mode, wrist camera, language-conditioned
+       │  saves checkpoint
+       ▼
+  data/<exp>/checkpoint/octo_finetune/experiment_<timestamp>/
 ```
 
-**Real mode** (physical Doosan robot):
+### Sim inference
+
 ```
-tcp_ros_bridge.py       — Listens on TCP port 9000, publishes to /joint_command
-    │
-    ▼ (/joint_command)
-joint_service_client.py — Converts positions (rad→deg), calls /dsr01/motion/move_joint
-    │
-    ▼ (MoveJoint service)
-Doosan H2017            — Physical robot executes movement
+sim_node.py             Isaac Sim scene + ROS2 node
+  publishes  /mecheye/color   (camera frames)
+  subscribes /eef_delta       (EEF delta actions)
+       ↕  ROS2
+run_octo_live.py        Octo inference loop
+  subscribes /mecheye/color
+  publishes  /eef_delta
 ```
 
-**End-to-end mode** (Octo VLA → real robot):
+### Real robot inference
+
 ```
-MechEye camera          — Captures RGB frames
-    │
-    ▼
-run_octo_live.py        — Runs Octo inference, produces 7-DOF EEF delta actions
-    │
-    ▼ (TCP port 9005)
-tcp_ros_bridge.py       — Publishes to /joint_command
-    │
-    ▼ (/joint_command)
-joint_service_client.py — Calls /dsr01/motion/move_joint
-    │
-    ▼
-Doosan H2017
+MechEye camera
+  └─ run_octo_live.py   Octo inference → TCP EEF deltas (port 9005)
+       │  TCP
+       ▼
+  tcp_ros_bridge.py     TCP receiver → publishes /joint_command
+       │  ROS2
+       ▼
+  joint_service_client.py   rad→deg, calls /dsr01/motion/move_joint
+       │  ROS2 service
+       ▼
+  Doosan H2017
+```
+
+---
+
+## Repository structure
+
+```
+ootf_ros2/
+├── run.sh                          Single entry point for all modes
+├── launch/
+│   ├── pipeline.sh                 Collect → convert → finetune
+│   ├── sim_inference.sh            Isaac Sim + Octo VLA
+│   ├── real_inference.sh           Real robot + Octo VLA
+│   └── debug.sh                    Individual component launcher + policy diagnosis
+├── src/
+│   ├── isaac/
+│   │   ├── collect.py              Headless episode collection in Isaac Sim
+│   │   ├── sim_node.py             Isaac Sim ROS2 node (inference-time)
+│   │   └── task.py                 Pick-and-place task definition and waypoint sampling
+│   ├── vla/
+│   │   ├── octo_policy.py          Octo model wrapper (inference)
+│   │   ├── run_octo_live.py        Live Octo inference loop
+│   │   ├── mech_eye_camera.py      MechEye SDK and ROS2 camera interfaces
+│   │   ├── tcp_ros_bridge.py       TCP receiver → /joint_command publisher
+│   │   ├── tcp_sender.py           EEF delta sender (TCP or ROS2)
+│   │   ├── joint_service_client.py /joint_command → Doosan MoveJoint service
+│   │   └── axis_check.py           Utility to verify axis directions
+│   └── training/
+│       ├── pipeline.py             Orchestrates convert + finetune steps
+│       ├── finetune_config.py      Octo finetune configuration
+│       └── tfds_builder.py         .npz → TFDS dataset builder
+├── debug/
+│   ├── debug_policy.py             Policy diagnosis script
+│   ├── policy_diagnosis/           PNG + TXT diagnosis reports (git-ignored)
+│   └── logs/                       Runtime session logs (git-ignored)
+├── scenes/
+│   ├── usd/doosan_BIC.usd          Isaac Sim scene
+│   └── h2017/urdf/
+│       ├── h2017.urdf              Doosan H2017 URDF
+│       └── h2017_lula.yaml         LULA kinematics config (auto-generated)
+└── data/                           Episodes, TFDS datasets, checkpoints (git-ignored)
+    └── <exp>/
+        ├── raw/                    Collected .npz episode files
+        ├── tfds/                   Converted TFDS dataset
+        └── checkpoint/             Octo finetune checkpoints
 ```
 
 ---
 
 ## Installation
 
-### 1. System requirements
+### Requirements
 - Ubuntu 22.04 or 24.04
-- ROS2 (Humble for Ubuntu 22.04, Jazzy for Ubuntu 24.04)
-- Python 3.11 (required by Isaac Sim — use pyenv or a virtual environment)
-- NVIDIA GPU (required for Octo/JAX inference)
+- ROS2 (Humble / Jazzy)
+- Python 3.11 (Isaac Sim requirement — use pyenv)
+- NVIDIA GPU with CUDA 12
 
-### 2. Install ROS2
+### 1. ROS2
 Follow the official guide for your distro:
-- [ROS2 Humble (Ubuntu 22.04)](https://docs.ros.org/en/humble/Installation/Ubuntu-Install-Debs.html)
-- [ROS2 Jazzy (Ubuntu 24.04)](https://docs.ros.org/en/jazzy/Installation/Ubuntu-Install-Debs.html)
+[Humble (22.04)](https://docs.ros.org/en/humble/Installation/Ubuntu-Install-Debs.html) |
+[Jazzy (24.04)](https://docs.ros.org/en/jazzy/Installation/Ubuntu-Install-Debs.html)
 
-### 3. Install Python 3.11 (for Isaac Sim)
-Isaac Sim requires Python 3.11. If your system Python differs, use pyenv:
+### 2. Python 3.11 via pyenv
 ```bash
 pyenv install 3.11.9
-pyenv global 3.11.9
+pyenv virtualenv 3.11.9 python3.11
+pyenv global python3.11
 ```
 
-### 4. Install NVIDIA Isaac Sim
+### 3. Isaac Sim
 ```bash
 pip install isaacsim==4.5.0 --extra-index-url https://pypi.nvidia.com
-pip install isaacsim-rl isaacsim-replicator isaacsim-extscache-physics isaacsim-extscache-kit isaacsim-extscache-kit-sdk --extra-index-url https://pypi.nvidia.com
+pip install isaacsim-rl isaacsim-replicator isaacsim-extscache-physics \
+            isaacsim-extscache-kit isaacsim-extscache-kit-sdk \
+            --extra-index-url https://pypi.nvidia.com
 ```
 
-> **Note:** Replace `4.5.0` with the Isaac Sim version you want. Check available versions at [pypi.nvidia.com](https://pypi.nvidia.com).
-
-### 5. Set up the Isaac Sim ROS2 workspace
+### 4. Isaac Sim ROS2 workspace
 ```bash
 git clone https://github.com/isaac-sim/IsaacSim-ros_workspaces.git ~/IsaacSim-ros_workspaces
-cd ~/IsaacSim-ros_workspaces
 # Follow the build instructions in that repo for your ROS2 distro
 ```
 
-### 6. Install Octo
+### 5. Octo + JAX
 ```bash
 git clone https://github.com/octo-models/octo.git ~/Documents/octo
 pip install -e ~/Documents/octo
-pip install "jax[cuda12_pip]==0.4.20" -f https://storage.googleapis.com/jax-releases/jax_cuda_releases.html
+pip install "jax[cuda12_pip]==0.4.20" \
+    -f https://storage.googleapis.com/jax-releases/jax_cuda_releases.html
+pip install matplotlib  # for policy diagnosis plots
 ```
 
-### 7. Install the MechEye camera SDK
+### 6. MechEye SDK (real robot only)
 ```bash
 pip install MechEyeAPI
 ```
 
-### 8. (Real mode only) Install the Doosan ROS2 package
-```bash
-# Follow the installation guide at:
-# https://github.com/doosan-robotics/doosan-robot2
-```
+### 7. Doosan ROS2 package (real robot only)
+Follow: https://github.com/doosan-robotics/doosan-robot2
 
-### 9. Clone this repository
+### 8. Clone this repo
 ```bash
 git clone https://github.com/DuncanKikkert1/ootf_ros2.git
 cd ootf_ros2
-```
-
----
-
-## Repository Structure
-
-```
-ootf_ros2/
-├── launch/
-│   ├── launch.sh               # Top-level launcher (virtual, real, or e2e mode)
-│   ├── launch_bridge.sh        # Start the TCP/ROS2 bridge
-│   ├── launch_isaacsim.sh      # Start Isaac Sim with the robot
-│   ├── launch_joint_client.sh  # Start the Doosan joint service client
-│   └── launch_octo.sh          # Start the Octo VLA inference loop
-├── octo_vla/
-│   ├── run_octo_live.py        # Main Octo inference loop
-│   ├── octo_policy.py          # Octo model wrapper
-│   ├── mech_eye_camera.py      # MechEye 3D camera interface
-│   └── tcp_sender.py           # Sends EEF delta actions over TCP
-├── scenes/
-│   ├── usd/
-│   │   └── doosan_BIC.usd      # Pre-built Isaac Sim scene (loaded by simulation.py)
-│   └── h2017/
-│       └── urdf/
-│           ├── h2017.urdf      # Doosan H2017 URDF robot description (used by LULA IK)
-│           └── h2017_lula.yaml # LULA kinematics config (auto-generated on first run)
-└── src/
-    ├── tcp_ros_bridge.py       # TCP receiver and ROS2 publisher
-    ├── joint_service_client.py # Forwards joint commands to Doosan MoveJoint service
-    └── simulation.py           # Isaac Sim simulation entry point
+chmod +x run.sh
 ```
 
 ---
 
 ## Usage
 
-Use the top-level `launch.sh` to start the full pipeline in one command:
+All modes are accessed through `run.sh`:
 
 ```bash
-# Virtual mode — TCP bridge + Isaac Sim
-bash launch/launch.sh virtual
-
-# Real mode — TCP bridge + Doosan joint service client
-bash launch/launch.sh real
-
-# End-to-end mode — Octo VLA + TCP bridge + Doosan robot
-bash launch/launch.sh e2e --instruction "pick up the circle"
-
-# End-to-end — prompt for instruction at runtime
-bash launch/launch.sh e2e
-
-# End-to-end — goal image conditioned
-bash launch/launch.sh e2e --goal-image /path/to/goal.png
-
-# End-to-end — USB camera instead of MechEye
-bash launch/launch.sh e2e --usb-camera 0 --instruction "pick up the circle"
-
-# End-to-end — dry run (no camera, random noise frames for testing)
-bash launch/launch.sh e2e --dry-run --instruction "pick up the circle"
-
-# End-to-end — custom Octo checkpoint
-bash launch/launch.sh e2e --model-path /path/to/checkpoint --dataset-name my_dataset \
-                           --instruction "pick up the circle"
+./run.sh <mode> [args]
 ```
 
-Press `Ctrl+C` to shut everything down cleanly.
-
-If your Isaac Sim ROS2 workspace is in a non-standard location, set `ISAAC_WS` before running:
+### Full pipeline — collect + convert + finetune
 ```bash
-ISAAC_WS=/path/to/workspace bash launch/launch.sh virtual
+./run.sh pipeline --output-dir data/exp_01 --n-episodes 200
 ```
+
+Run individual phases:
+```bash
+./run.sh pipeline --output-dir data/exp_01 --collect-only    # collect only
+./run.sh pipeline --output-dir data/exp_01 --convert-only    # .npz → TFDS only
+./run.sh pipeline --output-dir data/exp_01 --finetune-only   # finetune only
+```
+
+### Sim inference — Isaac Sim + Octo VLA
+```bash
+./run.sh sim --instruction "pick up the object"
+```
+
+### Real robot inference — MechEye + Octo + Doosan
+```bash
+./run.sh real --instruction "pick up the object"
+```
+
+### Debug & diagnostics
+```bash
+./run.sh debug policy              # diagnose finetuned policy vs ground truth
+./run.sh debug policy --n-episodes 20
+./run.sh debug policy --pretrained # compare against base pretrained model
+./run.sh debug policy --step 10000 # evaluate a specific checkpoint step
+
+./run.sh debug sim                 # start Isaac Sim node in isolation
+./run.sh debug bridge              # start TCP→ROS2 bridge in isolation
+./run.sh debug joint               # start Doosan joint client in isolation
+```
+
+Runtime logs for `sim`, `bridge`, and `joint` are saved to `debug/logs/` with a
+timestamp. Policy diagnosis reports (PNG plot + stats table) are saved to
+`debug/policy_diagnosis/` named after the checkpoint and data used.
 
 ---
 
-## TCP Message Formats
+## Finetuning
 
-### Bridge (port 9000) — joint commands from `tcp_ros_bridge.py`
+### Key configuration — `src/training/finetune_config.py`
 
+| Parameter | Default | Notes |
+|---|---|---|
+| `max_steps` | 50,000 | ~45 passes through 200 episodes |
+| `window_size` | 2 | Consecutive frames passed to model — gives temporal context |
+| `finetuning_mode` | `head_only` | Freezes transformer, trains action head |
+| `batch_size` | 32 | Keep at 32; larger batches risk overfitting on small datasets |
+| `peak_value` (LR) | 3e-4 | Cosine schedule with 2000-step warmup |
+
+### Finetuning modes
+
+| Mode | What trains | When to use |
+|---|---|---|
+| `head_mlp_only` | Final MLP layers only | Not recommended — too restrictive |
+| `head_only` | Full action head (attention + MLP) | **Default — best balance** |
+| `full` | Entire model | Only with very large datasets (1000+ episodes) |
+
+### Recommended dataset size
+- Minimum: 200 episodes (below this, 95/5 train/val split may fail)
+- Recommended: 400+ episodes for better workspace coverage
+
+---
+
+## TCP message formats
+
+### Joint commands — `tcp_ros_bridge.py` (port 9002)
 ```
 key_cmd;status;extra_num;gripper;x;y;z;aw;ap;ar
 ```
+Fields 1–3 are integers; fields 4–10 are floats (joint positions in radians).
 
-| Field       | Type  | Description            |
-|-------------|-------|------------------------|
-| `key_cmd`   | int   | Command code           |
-| `status`    | int   | Status code            |
-| `extra_num` | int   | Extra parameter        |
-| `gripper`   | float | Gripper value          |
-| `x`         | float | Joint 1 position (rad) |
-| `y`         | float | Joint 2 position (rad) |
-| `z`         | float | Joint 3 position (rad) |
-| `aw`        | float | Joint 4 position (rad) |
-| `ap`        | float | Joint 5 position (rad) |
-| `ar`        | float | Joint 6 position (rad) |
-
-Example: `250;254;0;0;0;0;1.57;0;1.57;0`
-
-### Octo output (port 9005) — EEF delta actions from `tcp_sender.py`
-
+### EEF delta actions — `tcp_sender.py` (port 9005)
 ```
 dx;dy;dz;drx;dry;drz;gripper\n
 ```
 
-| Field     | Type  | Description                      |
-|-----------|-------|----------------------------------|
-| `dx`      | float | EEF delta x (metres)             |
-| `dy`      | float | EEF delta y (metres)             |
-| `dz`      | float | EEF delta z (metres)             |
-| `drx`     | float | EEF delta roll (radians)         |
-| `dry`     | float | EEF delta pitch (radians)        |
-| `drz`     | float | EEF delta yaw (radians)          |
-| `gripper` | float | Gripper (0.0 = open, 1.0 = closed) |
+| Field | Unit | Description |
+|---|---|---|
+| `dx` `dy` `dz` | metres | End-effector position delta |
+| `drx` `dry` `drz` | radians | End-effector orientation delta (XYZ Euler) |
+| `gripper` | 0.0–1.0 | 0 = open, 1 = closed |
 
 ---
 
-## Verifying the Pipeline
+## Verifying a running pipeline
 
-Check that joint commands are being received:
 ```bash
+# Check camera frames are publishing (sim mode)
+ros2 topic echo /mecheye/color --no-arr
+
+# Check EEF delta actions are publishing
+ros2 topic echo /eef_delta
+
+# Check joint commands are reaching the bridge
 ros2 topic echo /joint_command
-```
 
-Check that joint states are being published (virtual mode only):
-```bash
+# Check joint states from sim
 ros2 topic echo /joint_states
 ```
-
----
-
-## Finetuning Octo
-
-To finetune on your own robot demonstrations, use the finetuning script in the Octo repo:
-
-```bash
-cd ~/Documents/octo
-python scripts/finetune.py \
-  --config scripts/configs/finetune_config.py \
-  --config.pretrained_path="hf://rail-berkeley/octo-small-1.5" \
-  --config.dataset_kwargs.name="your_dataset_name" \
-  --config.dataset_kwargs.data_dir="/path/to/your/data" \
-  --config.save_dir="/path/to/save/checkpoint" \
-  --config.modality="language_conditioned"
-```
-
-Then point `run_octo_live.py` at your checkpoint:
-```bash
-bash launch/launch.sh e2e \
-  --model-path /path/to/checkpoint \
-  --dataset-name your_dataset_name \
-  --instruction "pick up the circle"
-```
-
-See `~/Documents/octo/scripts/configs/finetune_config.py` for all available options including finetuning mode (`full`, `head_only`, `head_mlp_only`).

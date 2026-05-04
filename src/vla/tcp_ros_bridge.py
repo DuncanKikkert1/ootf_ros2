@@ -26,7 +26,7 @@ from sensor_msgs.msg import JointState
 # Configuration
 # -----------------------------------------------------------------------------
 HOST      = '0.0.0.0'
-PORT      = 9000
+PORT      = 9002
 ROS_TOPIC = '/joint_command'
 
 FIELD_NAMES = ['key_cmd', 'status', 'extra_num', 'gripper', 'x', 'y', 'z', 'aw', 'ap', 'ar']

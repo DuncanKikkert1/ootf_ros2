@@ -26,11 +26,24 @@
 import argparse
 import sys
 import time
+from pathlib import Path
 
 import cv2
 import numpy as np
 
-from mech_eye_camera import MechEyeCamera
+from mech_eye_camera import MechEyeCamera, ROS2Camera
+
+
+def _find_latest_checkpoint() -> Path | None:
+    """Return the most recently modified local finetune experiment dir, or None."""
+    data_root = Path(__file__).parent.parent.parent / "data"
+    if not data_root.exists():
+        return None
+    candidates = []
+    for exp_dir in data_root.glob("*/checkpoint/octo_finetune/experiment_*"):
+        if exp_dir.is_dir() and any(d.name.isdigit() for d in exp_dir.iterdir() if d.is_dir()):
+            candidates.append(exp_dir)
+    return max(candidates, key=lambda p: p.stat().st_mtime) if candidates else None
 
 
 class USBCamera:
@@ -70,7 +83,7 @@ class USBCamera:
         self.close()
 
 from octo_policy import OctoPolicy
-from tcp_sender  import EEFDeltaSender
+from tcp_sender  import EEFDeltaSender, ROS2EEFPublisher
 
 # ------------------------------------------------------------------
 # Defaults  (override via CLI)
@@ -85,7 +98,8 @@ CAMERA_PORT  = 50005
 SENDER_HOST  = "192.168.1.244"
 SENDER_PORT  = 9005
 
-MODEL_PATH   = "hf://rail-berkeley/octo-small-1.5"
+#MODEL_PATH   = "hf://rail-berkeley/octo-small-1.5"
+MODEL_PATH   = "hf://rail-berkeley/octo-base-1.5"
 DATASET_NAME = "bridge_dataset"
 
 STEP_DELAY   = 0.2   # seconds between inference steps (~5 Hz)
@@ -99,12 +113,17 @@ def parse_args():
     ap = argparse.ArgumentParser(description="Octo VLA live test loop.")
 
     # Model
-    ap.add_argument("--model-path",   type=str, default=MODEL_PATH,
-                    help=f"Octo checkpoint path or HF URI (default: {MODEL_PATH})")
-    ap.add_argument("--dataset-name", type=str, default=DATASET_NAME,
-                    help=f"Dataset key for unnormalisation stats (default: {DATASET_NAME})")
-    ap.add_argument("--window-size",  type=int, default=2,
-                    help="Observation history length passed to Octo (default: 2)")
+    ap.add_argument("--model-path",   type=str, default=None,
+                    help="Octo checkpoint path or HF URI (default: latest local finetune, "
+                         f"or {MODEL_PATH} if none found)")
+    ap.add_argument("--dataset-name", type=str, default=None,
+                    help="Dataset key for unnormalisation stats "
+                         "(default: ootf_synthetic for local checkpoints, "
+                         f"{DATASET_NAME} for pretrained)")
+    ap.add_argument("--step",         type=int, default=None,
+                    help="Checkpoint step to load (default: latest)")
+    ap.add_argument("--window-size",  type=int, default=1,
+                    help="Observation history length passed to Octo (default: 1)")
 
     # Task — mutually exclusive
     task_grp = ap.add_mutually_exclusive_group()
@@ -130,6 +149,12 @@ def parse_args():
                     help=f"Seconds between steps (default: {STEP_DELAY})")
     ap.add_argument("--usb-camera",  type=int, default=None, metavar="DEVICE",
                     help="Use a USB webcam instead of MechEye (device index, usually 0)")
+    ap.add_argument("--ros2-camera", action="store_true",
+                    help="Use the Isaac Sim camera via ROS2 topic instead of a physical camera")
+    ap.add_argument("--ros2-topic",  type=str, default="/mecheye/color",
+                    help="ROS2 Image topic to subscribe to (default: /mecheye/color)")
+    ap.add_argument("--ros2-output", action="store_true",
+                    help="Publish EEF deltas to /eef_delta ROS2 topic instead of TCP")
     ap.add_argument("--show-camera", action="store_true",
                     help="Open an OpenCV window showing the live camera feed")
     ap.add_argument("--dry-run",    action="store_true",
@@ -145,11 +170,27 @@ def parse_args():
 def main():
     args = parse_args()
 
+    # ---- resolve model path and dataset name ----
+    if args.model_path is None:
+        local_ckpt = _find_latest_checkpoint()
+        if local_ckpt:
+            args.model_path = str(local_ckpt)
+            print(f"[INFO] Using finetuned checkpoint: {local_ckpt}")
+        else:
+            args.model_path = MODEL_PATH
+            print(f"[INFO] No local checkpoint found — using pretrained: {MODEL_PATH}")
+
+    if args.dataset_name is None:
+        args.dataset_name = (
+            "ootf_synthetic" if not args.model_path.startswith("hf://") else DATASET_NAME
+        )
+
     # ---- load Octo ----
     policy = OctoPolicy(
         model_path   = args.model_path,
         dataset_name = args.dataset_name,
         window_size  = args.window_size,
+        step         = args.step,
     )
 
     # ---- set task ----
@@ -164,6 +205,13 @@ def main():
         policy.set_task_text(args.instruction)
 
     else:
+        if not sys.stdin.isatty():
+            sys.exit(
+                "[ERR] No task specified and stdin is not a terminal (running as background process).\n"
+                "      Pass --instruction or --goal-image when launching in vla/e2e mode.\n"
+                "      Example: bash launch/launch.sh vla --instruction 'pick up the circle'"
+            )
+
         # Interactive prompt — ask at runtime so you can change tasks without
         # restarting the script.
         print("\nTask mode:")
@@ -187,6 +235,9 @@ def main():
     if args.dry_run:
         print("[INFO] Dry-run mode — using random noise frames (no camera).")
         camera = None
+    elif args.ros2_camera:
+        camera = ROS2Camera(args.ros2_topic)
+        camera.connect()
     elif args.usb_camera is not None:
         camera = USBCamera(args.usb_camera)
         camera.connect()
@@ -194,9 +245,13 @@ def main():
         camera = MechEyeCamera(args.camera_ip, args.camera_port)
         camera.connect()
 
-    with EEFDeltaSender(args.host, args.port) as sender:
+    sender_ctx = ROS2EEFPublisher() if args.ros2_output else EEFDeltaSender(args.host, args.port)
+    with sender_ctx as sender:
         print(f"\n[INFO] Running. Ctrl+C to stop.")
-        print(f"[INFO] Sending to {args.host}:{args.port}  step_delay={args.step_delay}s\n")
+        if args.ros2_output:
+            print(f"[INFO] Publishing EEF deltas to /eef_delta  step_delay={args.step_delay}s\n")
+        else:
+            print(f"[INFO] Sending to {args.host}:{args.port}  step_delay={args.step_delay}s\n")
 
         policy.reset()
         step = 0

@@ -19,6 +19,51 @@
 import socket
 
 
+class ROS2EEFPublisher:
+    """Publishes 7-DOF EEF delta actions to a ROS2 topic (std_msgs/Float64MultiArray).
+
+    Drops in as a replacement for EEFDeltaSender when running in vla mode,
+    so Isaac Sim can receive deltas directly without a TCP hop.
+
+    Usage:
+        with ROS2EEFPublisher("/eef_delta") as pub:
+            pub.send(action)   # action: [dx, dy, dz, drx, dry, drz, gripper]
+    """
+
+    def __init__(self, topic: str = "/eef_delta"):
+        self.topic  = topic
+        self._node  = None
+        self._pub   = None
+
+    def connect(self):
+        import rclpy
+        from std_msgs.msg import Float64MultiArray
+        if not rclpy.ok():
+            rclpy.init()
+        self._node = rclpy.create_node("octo_eef_publisher")
+        self._pub  = self._node.create_publisher(Float64MultiArray, self.topic, 10)
+        print(f"[ROS2] Publishing EEF deltas on {self.topic}")
+
+    def send(self, action):
+        from std_msgs.msg import Float64MultiArray
+        msg      = Float64MultiArray()
+        msg.data = [float(v) for v in action]
+        self._pub.publish(msg)
+
+    def close(self):
+        if self._node is not None:
+            self._node.destroy_node()
+            self._node = None
+            print("[ROS2] EEF publisher node destroyed.")
+
+    def __enter__(self):
+        self.connect()
+        return self
+
+    def __exit__(self, *_):
+        self.close()
+
+
 class EEFDeltaSender:
     """Persistent TCP connection for sending 7-DOF EEF delta actions."""
 

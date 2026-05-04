@@ -17,8 +17,8 @@ import jax
 import jax.numpy as jnp
 from octo.model.octo_model import OctoModel
 
-# Octo was pretrained on 256×256 RGB images
-IMAGE_SIZE = 256
+# Octo wrist camera input is 128×128 (primary is 256×256)
+IMAGE_SIZE = 128
 
 # The pretrained checkpoint's action statistics come from bridge_dataset.
 # This is used to unnormalize Octo's normalised action output back to
@@ -42,19 +42,21 @@ class OctoPolicy:
     def __init__(
         self,
         model_path: str = "hf://rail-berkeley/octo-small-1.5",
+        #model_path: str = "hf://rail-berkeley/octo-base-1.5",
         dataset_name: str = DEFAULT_DATASET,
         window_size: int = 2,
+        step: int = None,
     ):
         """
         Args:
             model_path:   HuggingFace path or local directory of an Octo checkpoint.
-            dataset_name: Dataset key used to look up unnormalisation statistics.
-                          Must match what the checkpoint was trained / finetuned on.
+            dataset_name: Dataset key for unnormalisation stats.  Pass 'ootf_synthetic'
+                          when loading a locally finetuned checkpoint.
             window_size:  Number of consecutive frames passed to the model.
-                          2 gives the model minimal temporal context.
+            step:         Checkpoint step to load (None = latest).
         """
-        print(f"[OCTO] Loading model from: {model_path}")
-        self.model       = OctoModel.load_pretrained(model_path)
+        print(f"[OCTO] Loading model from: {model_path}" + (f" (step {step})" if step else ""))
+        self.model       = OctoModel.load_pretrained(model_path, step=step)
         self.dataset     = dataset_name
         self.window_size = window_size
 
@@ -85,7 +87,7 @@ class OctoPolicy:
         goal = cv2.resize(goal_rgb, (IMAGE_SIZE, IMAGE_SIZE)).astype(np.uint8)
         # create_tasks expects (batch, H, W, C) for goal images
         self.task = self.model.create_tasks(
-            goals={"image_primary": goal[None]}
+            goals={"image_wrist": goal[None]}
         )
         print("[OCTO] Task (goal image) set.")
 
@@ -138,20 +140,31 @@ class OctoPolicy:
         obs_images = np.stack(padded, axis=0)[None]          # (1, ws, 256, 256, 3)
         pad_mask   = np.array([[False] * n_pad + [True] * n_real])  # (1, ws)
 
+        dummy_primary = np.zeros((1, self.window_size, 1, 1, 3), dtype=np.uint8)
         observation = {
-            "image_primary":    obs_images,
+            "image_primary":     dummy_primary,
+            "image_wrist":       obs_images,
             "timestep_pad_mask": pad_mask,
         }
 
         # ---- sample action ----
         self._rng, key = jax.random.split(self._rng)
 
+        # Resolve unnormalization stats.  Finetuned checkpoints may store stats
+        # as a flat dict ({"action": ...}) while pretrained ones are nested
+        # ({"bridge_dataset": {"action": ...}}).
+        stats = self.model.dataset_statistics
+        if self.dataset in stats:
+            unnorm = stats[self.dataset]["action"]
+        elif "action" in stats:
+            unnorm = stats["action"]
+        else:
+            unnorm = None
+
         actions = self.model.sample_actions(
             observation,
             self.task,
-            unnormalization_statistics=(
-                self.model.dataset_statistics[self.dataset]["action"]
-            ),
+            unnormalization_statistics=unnorm,
             rng=key,
         )
         # actions: (batch=1, action_horizon, action_dim=7)

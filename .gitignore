@@ -31,13 +31,21 @@ _build/
 scenes/**
 !scenes/usd/
 !scenes/usd/doosan_BIC.usd
+scenes/usd/doosan_BIC_sim.usd
 !scenes/h2017/
 !scenes/h2017/urdf/
 !scenes/h2017/urdf/h2017.urdf
 !scenes/h2017/urdf/h2017_lula.yaml
 
-# VLA demos / training data
-octo_vla/Demos/
+# VLA demos / training data / wandb
+data/
+wandb/
+
+# Debug — track folder structure and scripts, ignore generated output files
+debug/logs/*
+debug/policy_diagnosis/*
+!debug/logs/.gitkeep
+!debug/policy_diagnosis/.gitkeep
 
 # OS
 .DS_Store
