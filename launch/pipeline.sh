@@ -80,27 +80,47 @@ if [[ "$PHASE" == "all" || "$PHASE" == "collect" ]]; then
         exit 1
     fi
     echo "  Episodes collected: $EPISODE_COUNT"
+
+    # Isaac Sim's Kit process and background threads don't always exit immediately
+    # when simulation_app.close() is called. Wait for them to fully release the
+    # GPU before starting JAX, otherwise JAX initialisation can fail.
+    echo "  Waiting for Isaac Sim processes to release GPU..."
+    sleep 10
+    pkill -f "kit_app" 2>/dev/null || true
+    pkill -f "omni.kit" 2>/dev/null || true
+    sleep 3
 fi
 
-# ── Convert + finetune ────────────────────────────────────────────────────────
-if [[ "$PHASE" == "all" || "$PHASE" == "convert" || "$PHASE" == "finetune" ]]; then
+# ── Convert ───────────────────────────────────────────────────────────────────
+if [[ "$PHASE" == "all" || "$PHASE" == "convert" ]]; then
     TRAIN_PY=$(detect_train_python)
-    if [ -z "$TRAIN_PY" ]; then
-        echo "ERROR: No Python found for training."
-        exit 1
-    fi
+    if [ -z "$TRAIN_PY" ]; then echo "ERROR: No Python found for training."; exit 1; fi
 
-    PHASE_FLAG=""
-    [[ "$PHASE" == "convert"  ]] && PHASE_FLAG="--convert-only"
-    [[ "$PHASE" == "finetune" ]] && PHASE_FLAG="--finetune-only"
-
-    echo "=== Train ==="
+    echo "=== Convert ==="
     echo "  Python  : $TRAIN_PY"
     echo "  Raw dir : $RAW_DIR"
     echo ""
     "$TRAIN_PY" "$PROJECT_ROOT/src/training/pipeline.py" \
         --raw-dir    "$RAW_DIR" \
         --output-dir "$OUTPUT_DIR" \
-        $PHASE_FLAG \
+        --convert-only \
+        "${TRAIN_ARGS[@]}" || exit 1
+fi
+
+# ── Finetune ──────────────────────────────────────────────────────────────────
+# Run as a separate process from convert so TensorFlow/TFDS state initialised
+# during download_and_prepare() does not interfere with JAX GPU allocation.
+if [[ "$PHASE" == "all" || "$PHASE" == "finetune" ]]; then
+    TRAIN_PY=$(detect_train_python)
+    if [ -z "$TRAIN_PY" ]; then echo "ERROR: No Python found for training."; exit 1; fi
+
+    echo "=== Finetune ==="
+    echo "  Python  : $TRAIN_PY"
+    echo "  Raw dir : $RAW_DIR"
+    echo ""
+    "$TRAIN_PY" "$PROJECT_ROOT/src/training/pipeline.py" \
+        --raw-dir    "$RAW_DIR" \
+        --output-dir "$OUTPUT_DIR" \
+        --finetune-only \
         "${TRAIN_ARGS[@]}" || exit 1
 fi

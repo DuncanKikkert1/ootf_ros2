@@ -59,7 +59,7 @@ print(os.path.join(os.path.dirname(isaacsim.__file__), 'exts', 'isaacsim.ros2.br
         LOG="$LOG_DIR/sim_${TIMESTAMP}.log"
         echo "Starting sim_node.py  (ROS_DISTRO=$ROS_DISTRO)"
         echo "Logging to $LOG"
-        "$ISAAC_PY" "$PROJECT_ROOT/src/isaac/sim_node.py" 2>&1 | tee "$LOG"
+        "$ISAAC_PY" -u "$PROJECT_ROOT/src/isaac/sim_node.py" 2>&1 | tee "$LOG"
         ;;
 
     bridge)
@@ -84,6 +84,16 @@ print(os.path.join(os.path.dirname(isaacsim.__file__), 'exts', 'isaacsim.ros2.br
         echo "Starting joint_service_client.py  (ROS_DISTRO=$ROS_DISTRO)"
         echo "Logging to $LOG"
         python3 "$PROJECT_ROOT/src/vla/joint_service_client.py" 2>&1 | tee "$LOG"
+        ;;
+
+    gripper-test)
+        # ── Surface gripper test (requires sim to be running) ────────────────
+        source "/opt/ros/$ROS_DISTRO/setup.bash"
+        export ROS_DISTRO
+        export RMW_IMPLEMENTATION=rmw_fastrtps_cpp
+
+        echo "Running gripper test  (ROS_DISTRO=$ROS_DISTRO)"
+        python3 "$PROJECT_ROOT/debug/test_gripper.py"
         ;;
 
     policy)

@@ -79,7 +79,7 @@ class OctoFinetuner:
         config = Path(__file__).parent / "finetune_config.py"
         cmd = [
             sys.executable, str(script),
-            f"--config={config}:head_only,text_conditioned",
+            f"--config={config}:{self.finetune_mode},text_conditioned",
             f"--config.pretrained_path={self.pretrained_path}",
             f"--config.dataset_kwargs.data_dir={self.tfds_dir}",
             f"--config.num_steps={self.n_steps}",

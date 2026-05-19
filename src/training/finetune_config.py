@@ -121,7 +121,6 @@ def get_config(config_string="head_only,text_conditioned"):
         ),
     )
 
-    config["frame_transform_threads"] = 16
     config["traj_transform_kwargs"] = traj_transform_kwargs
     config["frame_transform_kwargs"] = frame_transform_kwargs
     return ConfigDict(config)

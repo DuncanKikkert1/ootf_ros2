@@ -14,7 +14,8 @@ the resulting policy drives the robot in simulation or on the real hardware.
 ```
 Isaac Sim (headless)
   └─ collect.py          Scripted pick-and-place with Replicator domain randomisation
-       │  saves .npz episodes  (images, actions, instruction)
+       │  random cube or sphere per episode; inactive object parked underground
+       │  saves .npz episodes  (images, actions, instruction, obj_type)
        ▼
   tfds_builder.py        Converts .npz → TFDS dataset  (ootf_synthetic)
        │
@@ -69,7 +70,8 @@ ootf_ros2/
 │   ├── isaac/
 │   │   ├── collect.py              Headless episode collection in Isaac Sim
 │   │   ├── sim_node.py             Isaac Sim ROS2 node (inference-time)
-│   │   └── task.py                 Pick-and-place task definition and waypoint sampling
+│   │   ├── task.py                 Pick-and-place task definition and waypoint sampling
+│   │   └── gripper.py              SMC two-cup surface gripper controller (Isaac SurfaceGripper)
 │   ├── vla/
 │   │   ├── octo_policy.py          Octo model wrapper (inference)
 │   │   ├── run_octo_live.py        Live Octo inference loop
@@ -84,6 +86,8 @@ ootf_ros2/
 │       └── tfds_builder.py         .npz → TFDS dataset builder
 ├── debug/
 │   ├── debug_policy.py             Policy diagnosis script
+│   ├── test_gripper.py             Surface gripper open/close test (sim running)
+│   ├── visualize_episode.py        Plot and inspect collected .npz episodes
 │   ├── policy_diagnosis/           PNG + TXT diagnosis reports (git-ignored)
 │   └── logs/                       Runtime session logs (git-ignored)
 ├── scenes/
@@ -200,6 +204,7 @@ Run individual phases:
 ./run.sh debug sim                 # start Isaac Sim node in isolation
 ./run.sh debug bridge              # start TCP→ROS2 bridge in isolation
 ./run.sh debug joint               # start Doosan joint client in isolation
+./run.sh debug gripper-test        # open/close gripper while sim is running
 ```
 
 Runtime logs for `sim`, `bridge`, and `joint` are saved to `debug/logs/` with a
