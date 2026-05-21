@@ -4,7 +4,7 @@ from ml_collections import ConfigDict
 from ml_collections.config_dict import FieldReference, placeholder
 
 
-def get_config(config_string="head_only,text_conditioned"):
+def get_config(config_string="head_mlp_only,text_conditioned"):
     mode, task = config_string.split(",")
     assert task in ["image_conditioned", "text_conditioned", "multimodal"]
     assert mode in ["full", "head_only", "head_mlp_only"]

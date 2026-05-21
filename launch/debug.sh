@@ -13,7 +13,7 @@ PROJECT_ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 COMPONENT=$1
 TIMESTAMP=$(date +%Y%m%d_%H%M%S)
 LOG_DIR="$PROJECT_ROOT/debug/logs"
-mkdir -p "$LOG_DIR"
+mkdir -p "$LOG_DIR/sim" "$LOG_DIR/collect" "$LOG_DIR/gripper"
 
 if [ -z "$COMPONENT" ]; then
     echo "Usage: bash launch/debug.sh [sim|bridge|joint|policy]"
@@ -56,7 +56,7 @@ print(os.path.join(os.path.dirname(isaacsim.__file__), 'exts', 'isaacsim.ros2.br
         export LD_LIBRARY_PATH="$ISAAC_BRIDGE/lib:$LD_LIBRARY_PATH"
         export PYTHONPATH="$ISAAC_BRIDGE/rclpy:$PYTHONPATH"
 
-        LOG="$LOG_DIR/sim_${TIMESTAMP}.log"
+        LOG="$LOG_DIR/sim/sim_${TIMESTAMP}.log"
         echo "Starting sim_node.py  (ROS_DISTRO=$ROS_DISTRO)"
         echo "Logging to $LOG"
         "$ISAAC_PY" -u "$PROJECT_ROOT/src/isaac/sim_node.py" 2>&1 | tee "$LOG"
@@ -92,8 +92,26 @@ print(os.path.join(os.path.dirname(isaacsim.__file__), 'exts', 'isaacsim.ros2.br
         export ROS_DISTRO
         export RMW_IMPLEMENTATION=rmw_fastrtps_cpp
 
+        LOG="$LOG_DIR/gripper/gripper_${TIMESTAMP}.log"
         echo "Running gripper test  (ROS_DISTRO=$ROS_DISTRO)"
-        python3 "$PROJECT_ROOT/debug/test_gripper.py"
+        echo "Logging to $LOG"
+        python3 "$PROJECT_ROOT/debug/debug_gripper.py" 2>&1 | tee "$LOG"
+        ;;
+
+    collect)
+        # ── Dry-run episode collector (no files written) ─────────────────────
+        ISAAC_PY=""
+        for py in $(find ~/.pyenv/versions -name "python3" 2>/dev/null | sort -r) "$(which python3 2>/dev/null)"; do
+            "$py" -c "import isaacsim" 2>/dev/null && ISAAC_PY="$py" && break
+        done
+        [ -z "$ISAAC_PY" ] && { echo "ERROR: No Python with isaacsim found."; exit 1; }
+
+        echo "Using Python : $ISAAC_PY"
+        echo ""
+        LOG="$LOG_DIR/collect/collect_debug_${TIMESTAMP}.log"
+        echo "Logging to $LOG"
+        shift   # drop "collect" so remaining args (--seq, --seed, …) pass through
+        exec "$ISAAC_PY" -u "$PROJECT_ROOT/debug/debug_episode_collect.py" "$@" 2>&1 | tee "$LOG"
         ;;
 
     policy)
@@ -112,7 +130,7 @@ print(os.path.join(os.path.dirname(isaacsim.__file__), 'exts', 'isaacsim.ros2.br
 
     *)
         echo "ERROR: Unknown component '$COMPONENT'."
-        echo "Usage: bash launch/debug.sh [sim|bridge|joint|policy]"
+        echo "Usage: bash launch/debug.sh [sim|bridge|joint|collect|policy]"
         exit 1
         ;;
 esac

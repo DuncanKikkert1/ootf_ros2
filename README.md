@@ -14,8 +14,10 @@ the resulting policy drives the robot in simulation or on the real hardware.
 ```
 Isaac Sim (headless)
   └─ collect.py          Scripted pick-and-place with Replicator domain randomisation
-       │  random cube or sphere per episode; inactive object parked underground
-       │  saves .npz episodes  (images, actions, instruction, obj_type)
+       │  random cube / cylinder / pyramid per episode; inactive objects parked underground
+       │  waypoints adapt per object type (height, approach clearance, grip dwell)
+       │  EEF orientation fixed straight-down throughout → orientation preserved on conveyor
+       │  saves .npz episodes  (images, actions, instruction)
        ▼
   tfds_builder.py        Converts .npz → TFDS dataset  (ootf_synthetic)
        │
@@ -221,7 +223,7 @@ timestamp. Policy diagnosis reports (PNG plot + stats table) are saved to
 |---|---|---|
 | `max_steps` | 50,000 | ~45 passes through 200 episodes |
 | `window_size` | 2 | Consecutive frames passed to model — gives temporal context |
-| `finetuning_mode` | `head_only` | Freezes transformer, trains action head |
+| `finetuning_mode` | `head_mlp_only` | Freezes transformer + attention, trains final MLP only |
 | `batch_size` | 32 | Keep at 32; larger batches risk overfitting on small datasets |
 | `peak_value` (LR) | 3e-4 | Cosine schedule with 2000-step warmup |
 
@@ -229,8 +231,8 @@ timestamp. Policy diagnosis reports (PNG plot + stats table) are saved to
 
 | Mode | What trains | When to use |
 |---|---|---|
-| `head_mlp_only` | Final MLP layers only | Not recommended — too restrictive |
-| `head_only` | Full action head (attention + MLP) | **Default — best balance** |
+| `head_mlp_only` | Final MLP layers only | **Default — preserves pretraining, teaches pick-and-place skill** |
+| `head_only` | Full action head (attention + MLP) | More capacity, risks overwriting pretrained attention |
 | `full` | Entire model | Only with very large datasets (1000+ episodes) |
 
 ### Recommended dataset size

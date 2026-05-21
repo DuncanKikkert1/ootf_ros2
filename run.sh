@@ -32,6 +32,7 @@ case "$MODE" in
         echo "  real     [--instruction \"...\"]                  Real robot + Octo VLA"
         echo "  debug    sim|bridge|joint                       Single component"
         echo "  debug    gripper-test                           Test surface gripper (sim must be running)"
+        echo "  debug    collect [--seq seq1-seq4] [--seed N]   Dry-run episode collector (no files written)"
         echo "  debug    policy [--n-episodes N] [--pretrained] Diagnose finetuned policy"
         exit 0
         ;;

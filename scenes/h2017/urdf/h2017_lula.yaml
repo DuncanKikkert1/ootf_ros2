@@ -10,7 +10,7 @@ cspace:
 
 root_link: base_link
 
-default_q: [0.0, 0.0, 0.0, 0.0, 0.0, 0.0]
+default_q: [0.0, 0.0, 1.57, 0.0, 1.57, 0.0]
 
 acceleration_limits: [40.0, 40.0, 40.0, 40.0, 40.0, 40.0]
 jerk_limits: [500.0, 500.0, 500.0, 500.0, 500.0, 500.0]

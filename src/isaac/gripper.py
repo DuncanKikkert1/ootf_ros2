@@ -40,26 +40,28 @@ _JOINTS_SCOPE_PATH = "/World/SurfaceGripperJoints"
 
 # Scan origins in the SMCGripperBody (= link_6) local frame (metres).
 # link_6 +Z points DOWNWARD in world, so positive Z = toward the cube.
-# Place these ~15 mm short of the physical contact face so the raycast
-# starts above the surface and scans downward through it.
+# clearanceOffset=0 so the scan starts at the joint origin.  maxGripDistance=80mm
+# gives plenty of margin.  Joint origin at Z=0.180 in link_6 frame → world Z
+# = link6_Z-0.180 = ~0.565m.  Cube top at ~0.529m is 3.6cm inside the window.
+# retryInterval=0 so every close_gripper() call fires a scan ray (no minimum wait).
 _CUP_TIPS = [
-    Gf.Vec3f(-0.022, -0.0189, 0.185),   # cup A
-    Gf.Vec3f( 0.020,  0.0235, 0.185),   # cup B
+    Gf.Vec3f(-0.022, -0.0189, 0.215),   # cup A
+    Gf.Vec3f( 0.020,  0.0235, 0.215),   # cup B
 ]
 
 _MARKER_TIPS = [
-    Gf.Vec3f(-0.022, -0.0189, 0.200),
-    Gf.Vec3f( 0.020,  0.0235, 0.200),
+    Gf.Vec3f(-0.022, -0.0189, 0.215),
+    Gf.Vec3f( 0.020,  0.0235, 0.215),
 ]
 
 # Identity → scan in +Z of body0 = downward in world (toward the cube).
 _JOINT_ROT = Gf.Quatf(1.0, 0.0, 0.0, 0.0)
 
 # Surface-gripper physics parameters
-_MAX_GRIP_DISTANCE   = 0.20   # m  — 20 cm scan range from cup tip
+_MAX_GRIP_DISTANCE   = 0.08   # m  — 8 cm scan range from joint origin
 _COAXIAL_FORCE_LIMIT = 500.0   # N  — axial pull-off limit
 _SHEAR_FORCE_LIMIT   = 2000.0  # N  — lateral force limit (high: arm moves fast)
-_RETRY_INTERVAL      = 0.5    # s  — re-attempt interval while closing
+_RETRY_INTERVAL      = 0.016  # s  — ≈ one physics frame at 60 Hz; scan retries every step
 
 # Visual marker appearance
 _MARKER_RADIUS = 0.005
@@ -69,9 +71,10 @@ _MARKER_COLOR  = Gf.Vec3f(1.0, 0.0, 0.0)
 class SurfaceGripperController:
     """Two-phase open/close controller for the SMC two-cup surface gripper."""
 
-    def __init__(self):
+    def __init__(self, verbose: bool = True):
         self._interface  = None
         self._body_prim  = None   # SingleRigidPrim set in acquire_interface()
+        self._verbose    = verbose
 
     # ── public API ───────────────────────────────────────────────────────────
 
@@ -81,10 +84,11 @@ class SurfaceGripperController:
         joint_paths = self._create_attachment_joints(stage)
         self._create_visual_markers(stage)
         self._create_surface_gripper_prim(stage, joint_paths)
-        print(f"[GRIPPER] Prims created")
-        print(f"[GRIPPER]   assembly body : {_ASSEMBLY_PATH}")
-        print(f"[GRIPPER]   gripper prim  : {_GRIPPER_PRIM_PATH}")
-        print(f"[GRIPPER]   cup tips (local frame): {_CUP_TIPS}")
+        if self._verbose:
+            print(f"[GRIPPER] Prims created")
+            print(f"[GRIPPER]   assembly body : {_ASSEMBLY_PATH}")
+            print(f"[GRIPPER]   gripper prim  : {_GRIPPER_PRIM_PATH}")
+            print(f"[GRIPPER]   cup tips (local frame): {_CUP_TIPS}")
 
     def acquire_interface(self):
         """Phase 2 — bind to the PhysX runtime.  Call AFTER world.reset()."""
@@ -92,13 +96,15 @@ class SurfaceGripperController:
         self._body_prim = SingleRigidPrim(prim_path=_ASSEMBLY_PATH, name="gripper_body")
         self._interface = _sg.acquire_surface_gripper_interface()
         self._interface.set_write_to_usd(True)
-        print("[GRIPPER] Interface acquired — ready")
-        self._diagnose()
+        if self._verbose:
+            print("[GRIPPER] Interface acquired — ready")
+            self._diagnose()
 
     def open(self):
         if self._interface:
             self._interface.open_gripper(_GRIPPER_PRIM_PATH)
-            print(f"[GRIPPER] open() → status={self._interface.get_gripper_status(_GRIPPER_PRIM_PATH)}")
+            if self._verbose:
+                print(f"[GRIPPER] open() → status={self._interface.get_gripper_status(_GRIPPER_PRIM_PATH)}")
 
     def close(self):
         if self._interface:
@@ -197,30 +203,34 @@ class SurfaceGripperController:
 
             prim.AddAppliedSchema("IsaacAttachmentPointAPI")
 
-            # transX, transY: velocity-only damping (stiffness=0) to reduce lateral swing
-            # without a position spring that would violently snap the cube on grip establishment.
+            # All translational axes: high-stiffness drives so the cube tracks
+            # the gripper rigidly.  transX/Y were previously stiffness=0 (damping
+            # only) which caused the cube to drift in XY during retract.
+            # transZ upper limit is 0.06 m to accommodate the 3 cm pick clearance
+            # (cup tip is ~3 cm above cube top at attachment time).
             for axis in ("transX", "transY"):
                 UsdPhysics.LimitAPI.Apply(prim, axis)
                 prim.GetAttribute(f"limit:{axis}:physics:high").Set(-1.0)
                 prim.GetAttribute(f"limit:{axis}:physics:low").Set(1.0)
                 _dl = UsdPhysics.DriveAPI.Apply(prim, axis)
-                _dl.GetStiffnessAttr().Set(0.0)
-                _dl.GetDampingAttr().Set(50.0)
+                _dl.GetStiffnessAttr().Set(1e6)
+                _dl.GetDampingAttr().Set(1e4)
 
-            # transZ: [0, 0.01 m] with spring — simulates suction cup compression
             UsdPhysics.LimitAPI.Apply(prim, "transZ")
-            prim.GetAttribute("limit:transZ:physics:high").Set(0.01)
+            prim.GetAttribute("limit:transZ:physics:high").Set(0.06)
             prim.GetAttribute("limit:transZ:physics:low").Set(0.0)
             _dz = UsdPhysics.DriveAPI.Apply(prim, "transZ")
-            _dz.GetStiffnessAttr().Set(5000.0)
-            _dz.GetDampingAttr().Set(100.0)
+            _dz.GetStiffnessAttr().Set(1e6)
+            _dz.GetDampingAttr().Set(1e4)
 
-            # rotX/Y/Z: ±3° with springs
-            for axis, k in (("rotX", 100.0), ("rotY", 100.0), ("rotZ", 10000.0)):
+            # rotX/Y/Z: stiff springs, ±10° range
+            for axis in ("rotX", "rotY", "rotZ"):
                 UsdPhysics.LimitAPI.Apply(prim, axis)
-                prim.GetAttribute(f"limit:{axis}:physics:high").Set(3.0)
-                prim.GetAttribute(f"limit:{axis}:physics:low").Set(-3.0)
-                UsdPhysics.DriveAPI.Apply(prim, axis).GetStiffnessAttr().Set(k)
+                prim.GetAttribute(f"limit:{axis}:physics:high").Set(10.0)
+                prim.GetAttribute(f"limit:{axis}:physics:low").Set(-10.0)
+                _dr = UsdPhysics.DriveAPI.Apply(prim, axis)
+                _dr.GetStiffnessAttr().Set(1e6)
+                _dr.GetDampingAttr().Set(1e4)
 
             try:
                 from pxr import PhysxSchema
@@ -230,7 +240,7 @@ class SurfaceGripperController:
                 pass
 
             prim.GetAttribute("isaac:forwardAxis").Set("Z")
-            prim.GetAttribute("isaac:clearanceOffset").Set(0.020)
+            prim.GetAttribute("isaac:clearanceOffset").Set(0.0)
 
             joint.GetBody0Rel().SetTargets([Sdf.Path(_ASSEMBLY_PATH)])
             # body1 = link_6.  The extension swaps this to the gripped cube at runtime.
@@ -252,7 +262,7 @@ class SurfaceGripperController:
     def _create_visual_markers(self, stage):
         """Red spheres parented under SMCGripperBody — they track the robot."""
         for i, tip_pos in enumerate(_MARKER_TIPS):
-            path   = f"{_ASSEMBLY_PATH}/Marker_{i:02d}"
+            path   = f"{_LINK6_PATH}/Marker_{i:02d}"
             sphere = UsdGeom.Sphere.Define(stage, path)
             sphere.GetRadiusAttr().Set(_MARKER_RADIUS)
             sphere.GetDisplayColorAttr().Set([_MARKER_COLOR])
