@@ -291,6 +291,13 @@ class PickAndPlaceTask:
         )
         return q, ok
 
+    def _eef_tilt_deg(self, ik, q: np.ndarray, robot_R: np.ndarray,
+                      ee_frame: str) -> float:
+        """Degrees of EEF Z-axis tilt from world-down, using LULA FK on q."""
+        _, fk_rot = ik.compute_forward_kinematics(ee_frame, q)
+        eef_z = (robot_R @ fk_rot) @ np.array([0.0, 0.0, 1.0])
+        return float(np.degrees(np.arccos(np.clip(-eef_z[2], -1.0, 1.0))))
+
     def sample(self, rng: np.random.Generator, ik,
                robot_world_pos: np.ndarray, robot_R: np.ndarray,
                ee_frame: str = 'link_6',
@@ -376,6 +383,15 @@ class PickAndPlaceTask:
         if not ok: return None
         q_p4,       ok = self._solve_ik(ik, pick_l6,     q_pick, robot_world_pos, robot_R, ee_frame, warm_start=q_p3)
         if not ok: return None
+        # LULA's orientation_tolerance is not always enforced strictly — the returned
+        # joints can produce visibly tilted EEF for certain kinematic configurations.
+        # Verify via FK and reject if pick waypoints exceed 2°; the episode is resampled.
+        _MAX_PICK_TILT_DEG = 2.0
+        for _lbl, _q in [('pre-pick', q_p3), ('pick-contact', q_p4)]:
+            _t = self._eef_tilt_deg(ik, _q, robot_R, ee_frame)
+            if _t > _MAX_PICK_TILT_DEG:
+                print(f"[IK-ORI] {_lbl} tilt {_t:.1f}° > {_MAX_PICK_TILT_DEG}° — resampling", flush=True)
+                return None
         _ik_pl      = ik_place if ik_place is not None else ik
         q_transfer, ok = self._solve_ik(_ik_pl, transfer,    q_down, robot_world_pos, robot_R, ee_frame)
         if not ok: return None
