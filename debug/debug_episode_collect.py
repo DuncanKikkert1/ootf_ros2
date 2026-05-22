@@ -65,8 +65,8 @@ def parse_args():
     ap.add_argument("--place-z",      type=float, default=0.85)
     ap.add_argument("--max-reach-xy", type=float, default=1.65)
     ap.add_argument("--eef-z-offset",      type=float, default=0.215)
-    ap.add_argument("--gripper-wait-sec",  type=float, default=3.0,
-                    help="Seconds to hold the arm at pick and retry gripper close (default 3.0).")
+    ap.add_argument("--gripper-wait-sec",  type=float, default=1.0,
+                    help="Seconds to hold the arm at pick and retry gripper close (default 1.0).")
     return ap.parse_args()
 
 
@@ -111,6 +111,7 @@ def main():
             forced_obj_sequence  = forced_seq,
             time_scale           = args.time_scale,
             gripper_wait_steps   = int(args.gripper_wait_sec * 60),
+            show_colliders       = True,
         ).run()
     except Exception:
         print("\n[DEBUG] ── FATAL ERROR ──────────────────────────", flush=True)

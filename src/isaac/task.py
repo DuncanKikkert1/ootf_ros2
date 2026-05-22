@@ -97,7 +97,14 @@ PYRAMID_POOL = [
 # Slightly above the 4.4 cm cup span measured in gripper.py.
 PYRAMID_GRIPPER_FP = 0.05
 PYRAMID_APPROACH   = 0.03   # extra pre-contact clearance for slanted faces
-PYRAMID_GRIP_DWELL = 90     # longer dwell for smaller contact area
+PYRAMID_GRIP_DWELL = 45     # dwell at contact before gripper fires (arm settled by then)
+
+# Pyramid approach needs more steps than cube because the EEF must swing from
+# home (J6≈0) to the tilted face-normal orientation (J6≈90°) — ~1.5°/step at
+# 60 steps is too fast for the PD controller and causes visible oscillation.
+PYRAMID_SAFE_STEPS     = 150  # home → pallet_safe (large J2 + J6 swing)
+PYRAMID_APPROACH_STEPS = 75   # pallet_safe → pre_pick, pre_pick → contact
+PYRAMID_TRANSFER_STEPS = 120  # retract → transfer and transfer → pre_place (large multi-joint swings)
 
 # IK solving tolerances — kept in sync with DataCollector constants
 _IK_POS_TOL = 0.005
@@ -105,6 +112,12 @@ _IK_ORI_TOL = 0.01
 
 # Home / rest pose (radians) — robot start position and final return waypoint.
 _JP_HOME = np.array([0.0, 0.0, 1.57, 0.0, 1.57, 0.0])
+
+# Shared step counts for cube/cylinder (straight-down EEF, smaller J6 swing than pyramid).
+_SAFE_STEPS     = 90   # home → pallet_safe (J2 swings ~90° from upright)
+_APPROACH_STEPS = 60   # pre-pick → contact and retract
+_TRANSFER_STEPS = 90   # retract → transfer and transfer → pre-place
+_HOME_STEPS     = 120  # retract-from-place → home (J1 ~90°, J2 ~80° in one arc)
 
 # Minimum absolute J2 value permitted at either end of any interpolated arc.
 # J2 ≈ 0 rad means the upper arm is near-vertical; an arc that crosses from
@@ -131,20 +144,23 @@ def _arc_crosses_vertical(a: float, b: float) -> bool:
 
 
 def _normalize_j6(waypoints: list) -> list:
-    """Replace each waypoint's J6 with the ±180° equivalent closest to zero.
+    """Resolve each J6 to the ±π equivalent closest to the preceding waypoint.
 
-    The SMC two-cup suction gripper has 180° rotational symmetry around its
-    approach axis, so J6 and J6 ± π produce an identical physical grasp.
-    Normalising to the smallest-magnitude equivalent keeps every wrist rotation
-    relative to home (J6 = 0) under 90°, eliminating the near-180° spins.
+    The SMC two-cup suction gripper has 180° rotational symmetry, so J6 and
+    J6±π produce identical grasps. Anchoring each step to the previous rather
+    than independently to zero eliminates inter-waypoint 180° spins that arise
+    when two adjacent IK solutions land on opposite sides of the ±π boundary.
+    The first waypoint is anchored to 0 (home J6).
     """
     result = []
+    prev_j6 = 0.0
     for wp in waypoints:
         q   = wp.position.copy()
         j6  = q[5]
         alt = j6 + (np.pi if j6 < 0 else -np.pi)
-        if abs(alt) < abs(j6):
+        if abs(alt - prev_j6) < abs(j6 - prev_j6):
             q[5] = alt
+        prev_j6 = q[5]
         result.append(Waypoint(q, wp.gripper, wp.n_steps))
     return result
 
@@ -385,19 +401,22 @@ class PickAndPlaceTask:
         if not ok: return None
 
         wps = [
-            Waypoint(q_safe,     0.0, 60),  # pallet safe – clearance above pick
-            Waypoint(q_p3,       0.0, 45),  # pre-pick
-            Waypoint(q_p4,       0.0, 60),  # pick contact (open)
-            Waypoint(q_p4,       1.0, gd),  # pick dwell   (closed)
-            Waypoint(q_p3,       1.0, 45),  # retract with object
-            Waypoint(q_transfer, 1.0, 75),  # transfer
-            Waypoint(q_p6,       1.0, 60),  # pre-place
-            Waypoint(q_p7,       1.0, 45),  # place contact (closed)
-            Waypoint(q_p7,       0.0, 45),  # place release (open)
-            Waypoint(q_p6,       0.0, 45),  # retract from place
-            Waypoint(_JP_HOME,   0.0, 60),  # return home
+            Waypoint(q_safe,     0.0, _SAFE_STEPS),      # pallet safe – clearance above pick
+            Waypoint(q_p3,       0.0, _APPROACH_STEPS),  # pre-pick
+            Waypoint(q_p4,       0.0, _APPROACH_STEPS),  # pick contact (open)
+            Waypoint(q_p4,       1.0, gd),               # pick dwell   (closed)
+            Waypoint(q_p3,       1.0, _APPROACH_STEPS),  # retract with object
+            Waypoint(q_transfer, 1.0, _TRANSFER_STEPS),  # transfer
+            Waypoint(q_p6,       1.0, _TRANSFER_STEPS),  # pre-place
+            Waypoint(q_p7,       1.0, 60),               # place contact (closed)
+            Waypoint(q_p7,       0.0, 45),               # place release (open)
+            Waypoint(q_p6,       0.0, 60),               # retract from place
+            Waypoint(_JP_HOME,   0.0, _HOME_STEPS),      # return home
         ]
-        wps = _normalize_j6(wps)
+        # Normalize all waypoints except the final home waypoint.  Home always
+        # needs J6=0 exactly; including it in normalization can flip it to ±π,
+        # causing the wrist to lerp to 180° and then snap back during settle.
+        wps = _normalize_j6(wps[:-1]) + [wps[-1]]
         return wps if _trajectory_safe(wps) else None
 
     def _build_pyramid_waypoints(
@@ -416,13 +435,12 @@ class PickAndPlaceTask:
 
         Pick phase (p3/p4) approaches along the chosen face normal with a tilted
         EEF so the suction cups press perpendicular into the sloped surface.
-        Place phase (p6/p7) uses straight-down orientation so the flat rectangular
-        base lands cleanly on the conveyor belt.
+        Place phase (p6/p7) maintains the same EEF orientation (q_pick) so the
+        gripped face is pressed flat against the conveyor belt.
         All Cartesian targets are pre-solved to joint angles during episode setup.
         Returns None if any IK solve fails.
         """
         q_pick = _quat_for_face_normal(n_outward)
-        q_down = _quat_eef_down()
         a      = self.approach + PYRAMID_APPROACH
         ez     = self.eef_z_offset
 
@@ -431,41 +449,67 @@ class PickAndPlaceTask:
         else:
             fc_off = np.array([0.0, side * W / 3.0, H / 3.0])
 
+        _PICK_CLEARANCE = 0.005                  # keep cup tips off face surface (same as cube)
         pick_fc  = pick_base + fc_off
-        pick_l6  = pick_fc  + ez * n_outward
+        pick_l6  = pick_fc  + (ez + _PICK_CLEARANCE) * n_outward
         pick_pre = pick_l6  + a  * n_outward   # pre-pick along face normal
 
-        place_l6    = np.array([place_base[0], place_base[1], place_base[2] + ez])
-        pallet_safe = pick_l6  + np.array([0.0, 0.0, 0.35])  # straight-up clearance above pick
-        transfer    = place_l6 + np.array([0.0, 0.0, 0.35])  # high above place zone
-        pre_place   = place_l6 + np.array([0.0, 0.0, 0.10])
+        # Raise the place target so the pyramid BASE lands at place_z, not the grip face.
+        # The grip face centroid is H/3 above the base; without this lift the base would
+        # collide with the conveyor before the arm reaches its target.
+        place_base_lifted = place_base + np.array([0.0, 0.0, H / 3.0])
+        place_l6    = place_base_lifted + ez * n_outward
+        pallet_safe = pick_l6   + 0.15 * n_outward              # clearance along face normal
+        transfer    = np.array([0.9, -0.5, 1.565])              # fixed mid-air waypoint, same as cube/cylinder
+        pre_place   = place_l6  + a  * n_outward               # approach belt along face normal
 
-        q_safe,     ok = self._solve_ik(ik, pallet_safe, q_pick, robot_world_pos, robot_R, ee_frame)
+        # Solve pick IK from contact outward so all three approach waypoints share
+        # the same kinematic branch — solves the "backs off during approach" symptom
+        # that occurred when pallet_safe was seeded from the default configuration.
+        q_p4,       ok = self._solve_ik(ik, pick_l6,     q_pick, robot_world_pos, robot_R, ee_frame)
         if not ok: return None
-        q_p3,       ok = self._solve_ik(ik, pick_pre,    q_pick, robot_world_pos, robot_R, ee_frame, warm_start=q_safe)
+        q_p3,       ok = self._solve_ik(ik, pick_pre,    q_pick, robot_world_pos, robot_R, ee_frame, warm_start=q_p4)
         if not ok: return None
-        q_p4,       ok = self._solve_ik(ik, pick_l6,     q_pick, robot_world_pos, robot_R, ee_frame, warm_start=q_p3)
+        q_safe,     ok = self._solve_ik(ik, pallet_safe, q_pick, robot_world_pos, robot_R, ee_frame, warm_start=q_p3)
         if not ok: return None
+
+        # Normalize J6 for the approach sequence now, so all five pre-contact waypoints
+        # (safe, pre-pick, pick-contact, dwell, retract) share a consistent J6 branch.
+        # Dwell and retract reuse q_p4/q_p3 arrays; without early normalization the arm
+        # would spin 180° between pick-contact and dwell — right as the gripper fires.
+        _pre = _normalize_j6([
+            Waypoint(q_safe, 0.0, 1),
+            Waypoint(q_p3,   0.0, 1),
+            Waypoint(q_p4,   0.0, 1),
+        ])
+        q_safe_n, q_p3_n, q_p4_n = _pre[0].position, _pre[1].position, _pre[2].position
+
         _ik_pl      = ik_place if ik_place is not None else ik
-        q_transfer, ok = self._solve_ik(_ik_pl, transfer,    q_down, robot_world_pos, robot_R, ee_frame)
+        q_transfer, ok = self._solve_ik(_ik_pl, transfer,  q_pick, robot_world_pos, robot_R, ee_frame)
         if not ok: return None
-        q_p6,       ok = self._solve_ik(_ik_pl, pre_place,   q_down, robot_world_pos, robot_R, ee_frame, warm_start=q_transfer)
+        # Snap transfer J6 to the ±π equivalent closest to normalized pick J6 before
+        # warm-starting place solves — the wrong J6 would propagate into J1-J5.
+        q_transfer = q_transfer.copy()
+        _alt = q_transfer[5] + (np.pi if q_transfer[5] < 0 else -np.pi)
+        if abs(_alt - q_p4_n[5]) < abs(q_transfer[5] - q_p4_n[5]):
+            q_transfer[5] = _alt
+        q_p6,       ok = self._solve_ik(_ik_pl, pre_place, q_pick, robot_world_pos, robot_R, ee_frame, warm_start=q_transfer)
         if not ok: return None
-        q_p7,       ok = self._solve_ik(_ik_pl, place_l6,    q_down, robot_world_pos, robot_R, ee_frame, warm_start=q_p6)
+        q_p7,       ok = self._solve_ik(_ik_pl, place_l6,  q_pick, robot_world_pos, robot_R, ee_frame, warm_start=q_p6)
         if not ok: return None
 
         wps = [
-            Waypoint(q_safe,     0.0, 60),              # pallet safe – clearance above pick
-            Waypoint(q_p3,       0.0, 45),              # pre-pick (tilted)
-            Waypoint(q_p4,       0.0, 60),              # pick contact (open)
-            Waypoint(q_p4,       1.0, PYRAMID_GRIP_DWELL),  # dwell (closed)
-            Waypoint(q_p3,       1.0, 45),              # retract with object
-            Waypoint(q_transfer, 1.0, 75),              # transfer
-            Waypoint(q_p6,       1.0, 60),              # pre-place
-            Waypoint(q_p7,       1.0, 45),              # place contact (closed)
+            Waypoint(q_safe_n,   0.0, PYRAMID_SAFE_STEPS),      # pallet safe – clearance above pick
+            Waypoint(q_p3_n,     0.0, PYRAMID_APPROACH_STEPS),  # pre-pick (tilted)
+            Waypoint(q_p4_n,     0.0, PYRAMID_APPROACH_STEPS),  # pick contact (open)
+            Waypoint(q_p4_n,     1.0, PYRAMID_GRIP_DWELL),          # dwell (closed)
+            Waypoint(q_p3_n,     1.0, PYRAMID_APPROACH_STEPS),   # retract with object
+            Waypoint(q_transfer, 1.0, PYRAMID_TRANSFER_STEPS, blend=15),  # transfer
+            Waypoint(q_p6,       1.0, PYRAMID_TRANSFER_STEPS),  # pre-place
+            Waypoint(q_p7,       1.0, 90),              # place contact (closed)
             Waypoint(q_p7,       0.0, 45),              # place release (open)
-            Waypoint(q_p6,       0.0, 45),              # retract from place
-            Waypoint(_JP_HOME,   0.0, 60),              # return home
+            Waypoint(q_p6,       0.0, 60),              # retract from place
+            Waypoint(_JP_HOME,   0.0, _HOME_STEPS),     # return home
         ]
-        wps = _normalize_j6(wps)
+        wps = _normalize_j6(wps[:-1]) + [wps[-1]]
         return wps if _trajectory_safe(wps) else None

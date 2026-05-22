@@ -85,7 +85,8 @@ class DataCollector:
         dry_run:             bool = False,
         forced_obj_sequence: list = None,
         time_scale:          int  = 1,
-        gripper_wait_steps:  int  = 0,
+        gripper_wait_steps:  int  = 60,
+        show_colliders:      bool = False,
     ):
         root = Path(__file__).parent.parent.parent
         self.raw_dir             = Path(raw_dir)
@@ -100,6 +101,7 @@ class DataCollector:
         self.forced_obj_sequence = forced_obj_sequence
         self.time_scale          = time_scale
         self.gripper_wait_steps  = gripper_wait_steps
+        self.show_colliders      = show_colliders
         self.raw_dir.mkdir(parents=True, exist_ok=True)
 
     # ── run ───────────────────────────────────────────────────────────────────
@@ -168,6 +170,13 @@ class DataCollector:
         print("[COLLECT] world.reset() ...", flush=True)
         world.reset()
 
+        if self.show_colliders:
+            enable_extension("omni.physx.ui")   # not started in Python kit profile
+            _cs = carb.settings.get_settings()
+            _cs.set_int("/persistent/physics/visualizationDisplayColliders", 2)
+            _cs.set_int("/persistent/physics/visualizationDisplayJoints",    2)
+            print("[COLLECT] Collision + joint visualization enabled (All)", flush=True)
+
         # ── Surface gripper (Phase 2: after world.reset) ──────────────────────
         gripper.acquire_interface()
 
@@ -208,6 +217,27 @@ class DataCollector:
 
         print("[COLLECT] wrist_cam.initialize() ...", flush=True)
         wrist_cam.initialize()
+
+        # ── Clamp solver velocity iterations to ≤4 to silence TGS warning ──────
+        # PhysX TGS solver changed behaviour for velocity_iteration_count > 4.
+        # /World/Pickables/Cube (rigid) and /World/h2017/root_joint (articulation)
+        # both exceed that limit in the USD asset; cap them here after world.reset().
+        try:
+            from pxr import PhysxSchema as _PhysxSchema
+
+            _cube_prim = stage.GetPrimAtPath("/World/Pickables/Cube")
+            if _cube_prim.IsValid():
+                _rb_api = _PhysxSchema.PhysxRigidBodyAPI.Apply(_cube_prim)
+                _rb_api.CreateSolverVelocityIterationCountAttr(1)
+                print("[COLLECT] /World/Pickables/Cube velocity iterations clamped to 1", flush=True)
+
+            _robot_prim = stage.GetPrimAtPath("/World/h2017/root_joint")
+            if _robot_prim.IsValid():
+                _art_api = _PhysxSchema.PhysxArticulationAPI.Apply(_robot_prim)
+                _art_api.GetSolverVelocityIterationCountAttr().Set(4)
+                print("[COLLECT] /World/h2017/root_joint velocity iterations clamped to 4", flush=True)
+        except Exception as _e:
+            print(f"[COLLECT] velocity-iteration clamp skipped: {_e}", flush=True)
 
         n_dof = robot.num_dof
         robot.get_articulation_controller().set_gains(
@@ -627,17 +657,26 @@ class DataCollector:
                     print(f"    ✓ arrived  TCP_tip=({_tip_world[0]:.3f}, "
                           f"{_tip_world[1]:.3f}, {_tip_world[2]:.3f}) m", flush=True)
                     if wp.gripper > 0.5 and not _gripper_scan_done:
-                        import omni.usd as _ousd
-                        _stage = _ousd.get_context().get_stage()
-                        _jp    = _stage.GetPrimAtPath("/World/SurfaceGripperJoints/D6Joint_00")
-                        _b1    = _jp.GetRelationship("physics:body1").GetTargets() if _jp.IsValid() else []
-                        _hit   = str(_b1[0]) if _b1 and str(_b1[0]) != "/World/h2017/link_6" else None
-                        print(f"    gripper scan: {_hit if _hit else 'No object within range'}", flush=True)
+                        # SurfaceGripper creates its own attachment joint; D6Joint body1
+                        # is never modified.  Use the gripper status and grippedObjects attr.
+                        if gripper.is_closed():
+                            import omni.usd as _ousd
+                            _gp   = _ousd.get_context().get_stage().GetPrimAtPath(
+                                "/World/SurfaceGripper")
+                            _attr = _gp.GetAttribute("isaac:grippedObjects") if _gp.IsValid() else None
+                            _objs = _attr.Get() if (_attr and _attr.IsValid()) else None
+                            if _objs:
+                                print(f"    gripper scan: gripped {list(_objs)}", flush=True)
+                            else:
+                                print(f"    gripper scan: status=closed "
+                                      f"(grippedObjects attr not available)", flush=True)
+                        else:
+                            print(f"    gripper scan: status=open — nothing gripped", flush=True)
                         _gripper_scan_done = True
 
             # Settle at home — PD controller needs extra frames to physically
             # reach the commanded position after the last Lerp step.
-            for _ in range(40):
+            for _ in range(self.HOME_SETTLE):
                 robot.get_articulation_controller().apply_action(
                     ArticulationAction(joint_positions=self.HOME_POS)
                 )
@@ -676,36 +715,43 @@ class DataCollector:
 
         L, W, H = meta['L'], meta['W'], meta['H']
 
-        # Remove old prim from Isaac scene tracking and USD stage.
-        if pyramid is not None:
-            try:
-                world.scene.remove_object("pick_pyramid")
-            except Exception:
-                pass
-        if stage.GetPrimAtPath(self.PYRAMID_PRIM).IsValid():
-            stage.RemovePrim(self.PYRAMID_PRIM)
+        is_first = pyramid is None
 
-        # Build the new apex pyramid mesh with the sampled dimensions.
+        # Overwrite the prim's geometry and physics attributes in place.
+        # UsdGeom.Mesh.Define is idempotent — it returns the existing prim when
+        # it already exists, so we never need to delete it.
+        #
+        # IMPORTANT: neither stage.RemovePrim() nor world.scene.remove_object()
+        # can be called here.  Both ultimately close the PhysX tensor simulation
+        # view, which globally invalidates ALL subsequent velocity queries.  By
+        # keeping the prim alive and the old wrapper registered, the tensor view
+        # stays valid and we can reuse the same SingleRigidPrim on every episode.
         self._build_pyramid_usd(stage, self.PYRAMID_PRIM, L, W, H, mass=0.25)
 
-        # Tell PhysX to reparse the USD stage and compile the new rigid body.
-        # This is cheaper than world.reset() and sufficient for a single new prim.
+        # Re-author robot-arm collision filter (AddTarget is idempotent).
+        from pxr import UsdPhysics as _UPhys, Sdf as _Sdf
+        _fpairs = _UPhys.FilteredPairsAPI.Apply(stage.GetPrimAtPath(self.PYRAMID_PRIM))
+        for _lk in ("base_link", "base", "link_1", "link_2",
+                    "link_3", "link_4", "link_5", "link_6"):
+            _fpairs.GetFilteredPairsRel().AddTarget(
+                _Sdf.Path(f"{self.ROBOT_PRIM}/{_lk}"))
+
+        # Tell PhysX to recompile the updated collision geometry.
         get_physx_interface().force_load_physics_from_usd()
-
-        # Wrap in SingleRigidPrim and re-register with the scene so the PhysX
-        # tensor simulation view is rebuilt around the new rigid body before
-        # any velocity queries are issued.
-        new_pyramid = SingleRigidPrim(prim_path=self.PYRAMID_PRIM, name="pick_pyramid")
-        world.scene.add(new_pyramid)
-        obj_map['pyramid'] = new_pyramid
-
-        # Reinitialise physics so Isaac Sim rebuilds its tensor view to include
-        # the new rigid body, then flush two frames for the memory swap to settle.
-        world.initialize_physics()
         for _ in range(2):
             world.step(render=False)
 
-        return new_pyramid
+        if is_first:
+            # First pyramid episode: prim is brand-new, create the wrapper and
+            # register it.  Physics is valid so __init__'s velocity query works.
+            pyramid = SingleRigidPrim(prim_path=self.PYRAMID_PRIM, name="pick_pyramid")
+            world.scene.add(pyramid)
+            obj_map['pyramid'] = pyramid
+
+        # Subsequent episodes: return the existing wrapper unchanged.  The prim
+        # was never deleted so the tensor view is still valid; the new geometry
+        # was compiled by force_load_physics_from_usd above.
+        return pyramid
 
     def _randomise_pyramid_colour(self, stage):
         """Set a random display colour on the pyramid mesh for visual diversity."""
@@ -765,12 +811,9 @@ class DataCollector:
         UsdPhysics.MassAPI.Apply(prim)
         prim.GetAttribute("physics:mass").Set(mass)
 
-        try:
-            from pxr import PhysxSchema
-            col = PhysxSchema.PhysxMeshCollisionAPI.Apply(prim)
-            col.GetCollisionMeshAttr().Set("convexHull")
-        except Exception:
-            pass
+        from pxr import PhysxSchema
+        PhysxSchema.PhysxConvexHullCollisionAPI.Apply(prim)
+        UsdPhysics.MeshCollisionAPI.Apply(prim).CreateApproximationAttr().Set("convexHull")
 
     @staticmethod
     def _generate_lula(urdf_path: str, output_path: str, default_q=None):
@@ -813,8 +856,10 @@ def parse_args():
     ap.add_argument("--place-x",      type=float, nargs=2, default=[-0.95, 0.85])
     ap.add_argument("--place-y",      type=float, nargs=2, default=[-1.55, -1.0])
     ap.add_argument("--place-z",      type=float, default=0.85)
-    ap.add_argument("--max-reach-xy", type=float, default=1.65)
-    ap.add_argument("--eef-z-offset", type=float, default=0.215)
+    ap.add_argument("--max-reach-xy",      type=float, default=1.65)
+    ap.add_argument("--eef-z-offset",      type=float, default=0.215)
+    ap.add_argument("--gripper-wait-steps", type=int,  default=60,
+                    help="Steps to hold at pick and retry gripper close (default 60).")
     return ap.parse_args()
 
 
@@ -837,10 +882,11 @@ def main():
                 max_reach_xy = args.max_reach_xy,
                 eef_z_offset = args.eef_z_offset,
             ),
-            n_episodes = args.n_episodes,
-            image_size = args.image_size,
-            seed       = args.seed,
-            scene_usd  = args.scene_usd,
+            n_episodes          = args.n_episodes,
+            image_size          = args.image_size,
+            seed                = args.seed,
+            scene_usd           = args.scene_usd,
+            gripper_wait_steps  = args.gripper_wait_steps,
         ).run()
     except Exception:
         print("\n[COLLECT] ── FATAL ERROR ──────────────────────────", flush=True)
