@@ -20,7 +20,8 @@ from pathlib import Path
 import numpy as np
 from scipy.spatial.transform import Rotation
 
-from task import PickAndPlaceTask, Waypoint, _OBJ_PARAMS, WAYPOINT_NAMES
+from task import (PickAndPlaceTask, SortingTask, Waypoint, _OBJ_PARAMS,
+                  WAYPOINT_NAMES, SORT_PLATFORM_CENTRES, SORT_PLATFORM_DIMS)
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -172,6 +173,9 @@ class DataCollector:
 
         # Pyramid is NOT pre-allocated; it is built fresh each episode between
         # episodes using force_load_physics_from_usd() so its L×W×H can vary.
+
+        if isinstance(self.task, SortingTask):
+            self._create_sort_platforms(stage)
 
         print("[COLLECT] world.reset() ...", flush=True)
         world.reset()
@@ -872,6 +876,53 @@ class DataCollector:
             f"jerk_limits: [{', '.join(['500.0']*n)}]\n"
         )
         print(f"[COLLECT] Generated LULA description → {output_path}")
+
+    @staticmethod
+    def _create_sort_platforms(stage):
+        """Create static collision slabs for the SortingTask target platforms.
+
+        Must be called BEFORE world.reset() so PhysX compiles them as static
+        (kinematic-less) colliders.  Each platform is a UsdGeom.Cube with
+        CollisionAPI but no RigidBodyAPI — immovable, zero mass, objects rest on top.
+        Collision with the robot arm is filtered out to avoid constraint stiffness
+        interfering with the IK-driven trajectories.
+        """
+        from pxr import UsdGeom, UsdPhysics, Gf, Sdf
+
+        robot_links = ("base_link", "base",
+                       "link_1", "link_2", "link_3",
+                       "link_4", "link_5", "link_6")
+
+        for obj_name in ('cube', 'cylinder', 'pyramid'):
+            centre = SORT_PLATFORM_CENTRES[obj_name]
+            dims   = SORT_PLATFORM_DIMS[obj_name]
+            path   = f"/World/SortPlatform_{obj_name}"
+
+            # Cube prim: size=1.0 so scale ops set the actual dimensions.
+            cube = UsdGeom.Cube.Define(stage, path)
+            cube.GetSizeAttr().Set(1.0)
+            prim = stage.GetPrimAtPath(path)
+
+            UsdGeom.Xformable(prim).AddTranslateOp().Set(
+                Gf.Vec3d(float(centre[0]), float(centre[1]), float(centre[2]))
+            )
+            UsdGeom.Xformable(prim).AddScaleOp().Set(
+                Gf.Vec3f(float(dims[0]), float(dims[1]), float(dims[2]))
+            )
+
+            # Static collider — no RigidBodyAPI → immovable.
+            UsdPhysics.CollisionAPI.Apply(prim)
+
+            # Filter robot-arm collision so arm trajectories aren't deflected.
+            fpairs = UsdPhysics.FilteredPairsAPI.Apply(prim)
+            for lk in robot_links:
+                fpairs.GetFilteredPairsRel().AddTarget(
+                    Sdf.Path(f"/World/h2017/{lk}")
+                )
+
+            cube.GetDisplayColorAttr().Set([Gf.Vec3f(0.55, 0.55, 0.55)])
+
+        print("[COLLECT] Sort platforms created (cube / cylinder / pyramid)", flush=True)
 
 
 # ─────────────────────────────────────────────────────────────────────────────

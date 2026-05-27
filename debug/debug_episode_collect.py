@@ -26,7 +26,7 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).parent.parent / "src" / "isaac"))
 
 from collect import DataCollector
-from task import PickAndPlaceTask
+from task import PickAndPlaceTask, SortingTask
 
 # ── Predefined episode sequences ──────────────────────────────────────────────
 SEQUENCES = {
@@ -71,6 +71,9 @@ def parse_args():
     ap.add_argument("--eef-z-offset",      type=float, default=0.215)
     ap.add_argument("--gripper-wait-sec",  type=float, default=1.0,
                     help="Seconds to hold the arm at pick and retry gripper close (default 1.0).")
+    ap.add_argument("--task-type", choices=["random", "sorting"], default="random",
+                    help="random: random place position (default).  "
+                         "sorting: fixed platform positions per object type.")
     return ap.parse_args()
 
 
@@ -108,18 +111,25 @@ def main():
 
     _failed = False
     try:
+        _task_cls = SortingTask if args.task_type == "sorting" else PickAndPlaceTask
+        _task_kw  = dict(
+            pick_x       = tuple(args.pick_x),
+            pick_y       = tuple(args.pick_y),
+            surface_z    = args.surface_z,
+            max_reach_xy = args.max_reach_xy,
+            eef_z_offset = args.eef_z_offset,
+        )
+        if args.task_type == "random":
+            _task_kw.update(
+                place_x = tuple(args.place_x),
+                place_y = tuple(args.place_y),
+                place_z = args.place_z,
+            )
+        print(f"[DEBUG] Task type: {args.task_type}  ({_task_cls.__name__})", flush=True)
+
         collector = DataCollector(
             raw_dir    = "/tmp/debug_run_scratch",
-            task       = PickAndPlaceTask(
-                pick_x       = tuple(args.pick_x),
-                pick_y       = tuple(args.pick_y),
-                surface_z    = args.surface_z,
-                place_x      = tuple(args.place_x),
-                place_y      = tuple(args.place_y),
-                place_z      = args.place_z,
-                max_reach_xy = args.max_reach_xy,
-                eef_z_offset = args.eef_z_offset,
-            ),
+            task       = _task_cls(**_task_kw),
             n_episodes           = n_episodes,
             image_size           = args.image_size,
             seed                 = args.seed,

@@ -500,6 +500,7 @@ class PickAndPlaceTask:
         ik, robot_world_pos: np.ndarray,
         robot_R: np.ndarray, ee_frame: str,
         ik_place=None,
+        ik_pre_place=None,
     ) -> Optional[List[Waypoint]]:
         """Pure joint-space 12-step sequence for pyramid pick-and-place.
 
@@ -556,7 +557,8 @@ class PickAndPlaceTask:
         ])
         q_safe_n, q_p3_n, q_p4_n = _pre[0].position, _pre[1].position, _pre[2].position
 
-        _ik_pl      = ik_place if ik_place is not None else ik
+        _ik_pl = ik_place if ik_place is not None else ik
+        _ik_pp = ik_pre_place if ik_pre_place is not None else _ik_pl
         q_transfer, ok = self._solve_ik(_ik_pl, transfer, q_pick, robot_world_pos, robot_R, ee_frame)
         if not ok: return None
         # Snap transfer J6 to the ±π equivalent closest to normalized pick J6 before
@@ -565,16 +567,43 @@ class PickAndPlaceTask:
         _alt = q_transfer[5] + (np.pi if q_transfer[5] < 0 else -np.pi)
         if abs(_alt - q_p4_n[5]) < abs(q_transfer[5] - q_p4_n[5]):
             q_transfer[5] = _alt
-        # Seed the pre-place IK with the pick J6 value so LULA finds a place solution
-        # on the same J6 branch.  The ±π snap above catches 180° flips; this seed
-        # prevents the smaller ~20° J6 drift that rotates the pyramid at placement.
-        _place_seed    = q_transfer.copy()
-        _place_seed[5] = q_p4_n[5]
-        q_p6,       ok = self._solve_ik(_ik_pl, pre_place, q_pick, robot_world_pos, robot_R, ee_frame,
-                                        warm_start=_place_seed)
+        # Compute geometric seeds for the place phase.  The belt zone (y≈-1.28)
+        # needs J1 pointing toward the platform and J2 well below 90°.
+        _pp_xyz = robot_R.T @ (pre_place - robot_world_pos)
+        _j1_est = float(np.arctan2(_pp_xyz[1], _pp_xyz[0]))
+        _j6     = q_p4_n[5]
+        _geo_seeds = [
+            np.array([_j1_est,        np.radians(66.), np.radians(66.), 0., np.radians(48.), _j6]),
+            np.array([_j1_est,        np.radians(77.), np.radians(41.), 0., np.radians(62.), _j6]),
+            np.array([_j1_est,        np.radians(56.), np.radians(70.), 0., np.radians(50.), _j6]),
+            np.array([_j1_est - 0.35, np.radians(66.), np.radians(66.), 0., np.radians(48.), _j6]),
+            np.array([_j1_est + 0.35, np.radians(66.), np.radians(66.), 0., np.radians(48.), _j6]),
+        ]
+        if _ik_pp is _ik_pl:
+            # Same solver: try q_transfer-based seed first (J6 continuity), then geo,
+            # then ik_place's own default_q (J1=-130°) which may find a different
+            # solution branch that avoids J2=90°.
+            _place_seed    = q_transfer.copy()
+            _place_seed[5] = q_p4_n[5]
+            _pp_seeds = [_place_seed] + _geo_seeds + [None]
+        else:
+            _pp_seeds = _geo_seeds + [None]
+        q_p6 = None
+        for _seed in _pp_seeds:
+            q_p6, ok = self._solve_ik(_ik_pp, pre_place, q_pick, robot_world_pos, robot_R, ee_frame,
+                                      warm_start=_seed)
+            if ok:
+                break
         if not ok: return None
-        q_p7,       ok = self._solve_ik(_ik_pl, place_l6,  q_pick, robot_world_pos, robot_R, ee_frame,
-                                        warm_start=q_p6)
+        # Try to solve place_l6 from q_p6, with geo seed fallbacks if that fails.
+        q_p7, ok = self._solve_ik(_ik_pp, place_l6, q_pick, robot_world_pos, robot_R, ee_frame,
+                                   warm_start=q_p6)
+        if not ok:
+            for _seed in _geo_seeds + [None]:
+                q_p7, ok = self._solve_ik(_ik_pp, place_l6, q_pick, robot_world_pos, robot_R, ee_frame,
+                                          warm_start=_seed)
+                if ok:
+                    break
         if not ok: return None
 
         # Snap place-side J6 to the same ±π branch as the pick J6.
@@ -604,4 +633,127 @@ class PickAndPlaceTask:
         ]
         wps = _normalize_j6(wps[:-1]) + [wps[-1]]
         return wps if _trajectory_safe(wps) else None
-    
+
+
+# ── Sorting task ───────────────────────────────────────────────────────────────
+
+# Platform centre positions [x, y, z] in world frame.  Slabs are 0.01 m thick;
+# the top surface (where objects rest) is at centre_z + 0.005 = 0.860 m.
+SORT_PLATFORM_CENTRES = {
+    'cube':     np.array([-0.5, -1.28, 0.855]),
+    'cylinder': np.array([ 0.0, -1.28, 0.855]),
+    'pyramid':  np.array([ 0.5, -1.28, 0.855]),
+}
+
+# Platform L × W × H (metres).
+SORT_PLATFORM_DIMS = {
+    'cube':     np.array([0.10, 0.10, 0.01]),
+    'cylinder': np.array([0.10, 0.10, 0.01]),
+    'pyramid':  np.array([0.25, 0.25, 0.01]),
+}
+
+_SORT_SURFACE_Z = 0.860   # platform top surface = centre_z + half-thickness
+
+
+class SortingTask(PickAndPlaceTask):
+    """Pick-and-sort variant: each object type has a fixed designated platform.
+
+    The pick side is identical to PickAndPlaceTask (random position on the pallet).
+    The place side always targets the platform assigned to the sampled object type:
+        cube     → [0.312, -1.28]
+        cylinder → [0.725, -1.28]
+        pyramid  → [1.17,  -1.28]
+    All placements target z = 0.860 m (top surface of 0.01 m thick platform slabs).
+    """
+
+    SORT_INSTRUCTIONS = [
+        "place the object on its designated platform on the belt",
+        "sort the object to its correct platform on the conveyor",
+        "move the object to its matching target platform",
+        "pick up the object and put it on the right slot on the belt",
+        "place the item on its correct platform",
+        "find the right platform and place the object on it",
+        "sort the item to its designated spot on the conveyor",
+        "deliver the object to its assigned platform on the belt",
+        "pick the object and sort it to the correct platform",
+        "move the item to its designated platform on the conveyor",
+    ]
+
+    def __init__(self, **kwargs):
+        kwargs.setdefault('place_z', _SORT_SURFACE_Z)
+        super().__init__(**kwargs)
+        self.instructions = self.SORT_INSTRUCTIONS
+
+    def sample(self, rng: np.random.Generator, ik,
+               robot_world_pos: np.ndarray, robot_R: np.ndarray,
+               ee_frame: str = 'link_6',
+               force_obj_type: str = None,
+               ik_place=None,
+               pick_yaw: float = 0.0):
+        obj_type    = force_obj_type if force_obj_type is not None \
+                      else str(rng.choice(self.OBJ_TYPES))
+        instruction = str(rng.choice(self.instructions))
+        pick_xy     = self._sample_xy(rng, self.pick_x, self.pick_y)
+
+        # Fixed place xy for this object type.
+        place_xy = SORT_PLATFORM_CENTRES[
+            obj_type if obj_type in SORT_PLATFORM_CENTRES else 'cube'
+        ][:2].copy()
+
+        if obj_type == 'pyramid':
+            pool_idx  = int(rng.integers(len(PYRAMID_POOL)))
+            dims      = PYRAMID_POOL[pool_idx]
+            L, W, H   = dims['L'], dims['W'], dims['H']
+            face_info = self._pyramid_best_face(L, W, H)
+
+            if face_info is None:
+                obj_type = 'cube'
+            else:
+                face_axis, n_pos = face_info
+                side      = int(rng.choice([-1, 1]))
+                n_outward = n_pos.copy()
+                if side == -1:
+                    n_outward[0 if face_axis == 'x' else 1] *= -1
+
+                pick_pos  = np.array([*pick_xy,  self.surface_z])
+                place_pos = np.array([*place_xy, self.place_z])
+
+                # Cheap XY reach check: the pyramid platform is at a fixed x that
+                # can be far from the robot.  The face normal shifts link_6 by
+                # eef_z_offset * n_outward in XY.  Reject face/side combos whose
+                # predicted place_l6 XY distance exceeds the robot's reach before
+                # spending IK calls — collect.py will resample with a new face/side.
+                _l6_xy  = place_xy + self.eef_z_offset * n_outward[:2]
+                _l6_rxy = _l6_xy   - robot_world_pos[:2]
+                if np.linalg.norm(_l6_rxy) > self.max_reach_xy:
+                    return None, instruction, pick_pos, place_pos, 'pyramid', \
+                           {'pool_idx': pool_idx, 'L': L, 'W': W, 'H': H,
+                            'face_axis': face_axis, 'side': side,
+                            'n_outward': n_outward}
+
+                # Use ik_place for both transfer and pre_place/place_l6.
+                # The previous failure of ik_place for pyramid came from a bad warm
+                # start (J1=-29° from q_transfer).  Geometric seeds (J1≈-47° biased
+                # toward the platform, J2=56-77°) avoid the near-singular J2≈90°
+                # configuration that ik converges to in the belt zone.
+                waypoints = self._build_pyramid_waypoints(
+                    pick_pos, place_pos, L, W, H, face_axis, side, n_outward,
+                    ik, robot_world_pos, robot_R, ee_frame,
+                    ik_place=ik_place, ik_pre_place=ik_place,
+                )
+                return waypoints, instruction, pick_pos, place_pos, 'pyramid', \
+                       {'pool_idx': pool_idx, 'L': L, 'W': W, 'H': H,
+                        'face_axis': face_axis, 'side': side,
+                        'n_outward': n_outward}
+
+        # cube / cylinder (or pyramid fallback)
+        params    = _OBJ_PARAMS[obj_type]
+        hh        = params['height'] / 2.0
+        pick_pos  = np.array([*pick_xy,  self.surface_z + hh])
+        place_pos = np.array([*place_xy, self.place_z   + hh])
+        waypoints = self._build_waypoints(
+            pick_pos, place_pos, params, ik, robot_world_pos, robot_R, ee_frame,
+            ik_place=ik_place, pick_yaw=pick_yaw,
+        )
+        return waypoints, instruction, pick_pos, place_pos, obj_type, {}
+
