@@ -161,7 +161,7 @@ def _normalize_j6(waypoints: list) -> list:
         if abs(alt - prev_j6) < abs(j6 - prev_j6):
             q[5] = alt
         prev_j6 = q[5]
-        result.append(Waypoint(q, wp.gripper, wp.n_steps))
+        result.append(Waypoint(q, wp.gripper, wp.n_steps, wp.blend))
     return result
 
 
@@ -297,7 +297,15 @@ class PickAndPlaceTask:
     def _solve_ik(self, ik, pos_world: np.ndarray, ori_wxyz: np.ndarray,
                   robot_world_pos: np.ndarray, robot_R: np.ndarray,
                   ee_frame: str, warm_start: np.ndarray = None):
-        """Resolve a world-space Cartesian target to joint angles. Returns (q, ok)."""
+        """Resolve a world-space Cartesian target to joint angles. Returns (q, ok).
+
+        All returned joint angles are wrapped to [-π, π].  The generated LULA YAML
+        has no joint position limits, so LULA can return angles such as 256.9° for
+        a joint whose hardware range is ±180°.  Wrapping here prevents those values
+        from reaching the waypoint list and the Isaac Sim ArticulationAction, which
+        would attempt to drive the joint to a physically unreachable position.
+        _normalize_j6 runs after IK and handles the J6 ±π symmetry separately.
+        """
         pos_robot = robot_R.T @ (pos_world - robot_world_pos)
         q, ok = ik.compute_inverse_kinematics(
             ee_frame, pos_robot, ori_wxyz,
@@ -305,7 +313,69 @@ class PickAndPlaceTask:
             orientation_tolerance=_IK_ORI_TOL,
             warm_start=warm_start,
         )
+        if ok:
+            q = (q + np.pi) % (2 * np.pi) - np.pi
         return q, ok
+
+    def _pick_ik_branch(
+        self,
+        ik,
+        pick_l6:     np.ndarray,
+        pick_pre:    np.ndarray,
+        pallet_safe: np.ndarray,
+        q_pick:      np.ndarray,
+        robot_world_pos: np.ndarray,
+        robot_R:     np.ndarray,
+        ee_frame:    str,
+    ):
+        """Return (q_safe, q_p3, q_p4) for the pick approach whose pallet-safe
+        joint configuration is closest to home in joint space, by trying several
+        IK seeds.  LULA finds different local minima depending on the seed; for
+        tilted-face pyramids the default-q (home) seed produces large J4/J5
+        swings.  Trying seeds with J5 negated, J1 pre-rotated toward the pick
+        position, and combinations thereof often reveals a branch where the arm
+        stays much closer to its rest pose.  Returns None if no seed yields a
+        complete three-waypoint chain.
+        """
+        pick_robot = robot_R.T @ (pick_l6 - robot_world_pos)
+        j1_est = float(np.arctan2(pick_robot[1], pick_robot[0]))
+
+        seeds = [
+            _JP_HOME.copy(),                                        # home (same as YAML default_q)
+            np.array([j1_est,  0.0, 1.57,  0.0,  1.57, 0.0]),    # J1 toward pick, J5 up
+            np.array([j1_est,  0.0, 1.57,  0.0, -1.57, 0.0]),    # J1 toward pick, J5 flipped
+            np.array([0.0,     0.0, 1.57,  0.0, -1.57, 0.0]),    # home + J5 flipped
+        ]
+
+        best_triple = None
+        best_dist   = np.inf
+        best_seed_i = -1
+
+        for i, seed in enumerate(seeds):
+            q4, ok4 = self._solve_ik(ik, pick_l6,     q_pick, robot_world_pos, robot_R, ee_frame,
+                                     warm_start=seed)
+            if not ok4:
+                continue
+            q3, ok3 = self._solve_ik(ik, pick_pre,    q_pick, robot_world_pos, robot_R, ee_frame,
+                                     warm_start=q4)
+            if not ok3:
+                continue
+            qs, oks = self._solve_ik(ik, pallet_safe, q_pick, robot_world_pos, robot_R, ee_frame,
+                                     warm_start=q3)
+            if not oks:
+                continue
+            dist = float(np.sum((qs - _JP_HOME) ** 2))
+            if dist < best_dist:
+                best_dist  = dist
+                best_triple = (qs, q3, q4)
+                best_seed_i = i
+
+        if best_triple is not None:
+            qs, _, _ = best_triple
+            print(f"[TASK] pick branch: seed={best_seed_i}  "
+                  f"q_safe={np.degrees(qs).round(1).tolist()}  "
+                  f"dist_home={best_dist:.3f}", flush=True)
+        return best_triple
 
     def sample(self, rng: np.random.Generator, ik,
                robot_world_pos: np.ndarray, robot_R: np.ndarray,
@@ -463,15 +533,17 @@ class PickAndPlaceTask:
         transfer    = np.array([0.9, -0.5, 1.565])              # fixed mid-air waypoint, same as cube/cylinder
         pre_place   = place_l6  + a  * n_outward               # approach belt along face normal
 
-        # Solve pick IK from contact outward so all three approach waypoints share
-        # the same kinematic branch — solves the "backs off during approach" symptom
-        # that occurred when pallet_safe was seeded from the default configuration.
-        q_p4,       ok = self._solve_ik(ik, pick_l6,     q_pick, robot_world_pos, robot_R, ee_frame)
-        if not ok: return None
-        q_p3,       ok = self._solve_ik(ik, pick_pre,    q_pick, robot_world_pos, robot_R, ee_frame, warm_start=q_p4)
-        if not ok: return None
-        q_safe,     ok = self._solve_ik(ik, pallet_safe, q_pick, robot_world_pos, robot_R, ee_frame, warm_start=q_p3)
-        if not ok: return None
+        # Solve pick approach with multi-seed branch selection: try several IK seeds
+        # and keep the (q_safe, q_p3, q_p4) triple whose pallet-safe config is closest
+        # to home in joint space.  LULA finds different local minima from different seeds;
+        # the default seed (home) often yields large J4/J5 swings for tilted-face pyramids.
+        _pick_branch = self._pick_ik_branch(
+            ik, pick_l6, pick_pre, pallet_safe, q_pick,
+            robot_world_pos, robot_R, ee_frame,
+        )
+        if _pick_branch is None:
+            return None
+        q_safe, q_p3, q_p4 = _pick_branch
 
         # Normalize J6 for the approach sequence now, so all five pre-contact waypoints
         # (safe, pre-pick, pick-contact, dwell, retract) share a consistent J6 branch.
@@ -485,7 +557,7 @@ class PickAndPlaceTask:
         q_safe_n, q_p3_n, q_p4_n = _pre[0].position, _pre[1].position, _pre[2].position
 
         _ik_pl      = ik_place if ik_place is not None else ik
-        q_transfer, ok = self._solve_ik(_ik_pl, transfer,  q_pick, robot_world_pos, robot_R, ee_frame)
+        q_transfer, ok = self._solve_ik(_ik_pl, transfer, q_pick, robot_world_pos, robot_R, ee_frame)
         if not ok: return None
         # Snap transfer J6 to the ±π equivalent closest to normalized pick J6 before
         # warm-starting place solves — the wrong J6 would propagate into J1-J5.
@@ -493,18 +565,37 @@ class PickAndPlaceTask:
         _alt = q_transfer[5] + (np.pi if q_transfer[5] < 0 else -np.pi)
         if abs(_alt - q_p4_n[5]) < abs(q_transfer[5] - q_p4_n[5]):
             q_transfer[5] = _alt
-        q_p6,       ok = self._solve_ik(_ik_pl, pre_place, q_pick, robot_world_pos, robot_R, ee_frame, warm_start=q_transfer)
+        # Seed the pre-place IK with the pick J6 value so LULA finds a place solution
+        # on the same J6 branch.  The ±π snap above catches 180° flips; this seed
+        # prevents the smaller ~20° J6 drift that rotates the pyramid at placement.
+        _place_seed    = q_transfer.copy()
+        _place_seed[5] = q_p4_n[5]
+        q_p6,       ok = self._solve_ik(_ik_pl, pre_place, q_pick, robot_world_pos, robot_R, ee_frame,
+                                        warm_start=_place_seed)
         if not ok: return None
-        q_p7,       ok = self._solve_ik(_ik_pl, place_l6,  q_pick, robot_world_pos, robot_R, ee_frame, warm_start=q_p6)
+        q_p7,       ok = self._solve_ik(_ik_pl, place_l6,  q_pick, robot_world_pos, robot_R, ee_frame,
+                                        warm_start=q_p6)
         if not ok: return None
+
+        # Snap place-side J6 to the same ±π branch as the pick J6.
+        # The IK for the belt zone (different arm config) can land on the π-opposite
+        # J6 solution; without this snap the gripper rotates ~180° around the
+        # approach axis between pick and place, which appears as a 180° rotation of
+        # the placed pyramid.
+        q_p6 = q_p6.copy()
+        q_p7 = q_p7.copy()
+        for _q in (q_p6, q_p7):
+            _alt = _q[5] + (np.pi if _q[5] < 0 else -np.pi)
+            if abs(_alt - q_p4_n[5]) < abs(_q[5] - q_p4_n[5]):
+                _q[5] = _alt
 
         wps = [
             Waypoint(q_safe_n,   0.0, PYRAMID_SAFE_STEPS),      # pallet safe – clearance above pick
             Waypoint(q_p3_n,     0.0, PYRAMID_APPROACH_STEPS),  # pre-pick (tilted)
             Waypoint(q_p4_n,     0.0, PYRAMID_APPROACH_STEPS),  # pick contact (open)
-            Waypoint(q_p4_n,     1.0, PYRAMID_GRIP_DWELL),          # dwell (closed)
-            Waypoint(q_p3_n,     1.0, PYRAMID_APPROACH_STEPS),   # retract with object
-            Waypoint(q_transfer, 1.0, PYRAMID_TRANSFER_STEPS, blend=15),  # transfer
+            Waypoint(q_p4_n,     1.0, PYRAMID_GRIP_DWELL),      # dwell (closed)
+            Waypoint(q_p3_n,     1.0, PYRAMID_APPROACH_STEPS),  # retract with object
+            Waypoint(q_transfer, 1.0, PYRAMID_TRANSFER_STEPS),  # transfer (no blend: arm settles before pre-place)
             Waypoint(q_p6,       1.0, PYRAMID_TRANSFER_STEPS),  # pre-place
             Waypoint(q_p7,       1.0, 90),              # place contact (closed)
             Waypoint(q_p7,       0.0, 45),              # place release (open)
@@ -513,3 +604,4 @@ class PickAndPlaceTask:
         ]
         wps = _normalize_j6(wps[:-1]) + [wps[-1]]
         return wps if _trajectory_safe(wps) else None
+    

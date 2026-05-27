@@ -50,8 +50,12 @@ def parse_args():
             "seq3: 1×pyramid  |  seq4: cube→cylinder→pyramid"
         ),
     )
+    ap.add_argument("--from-episode", default=None, metavar="NPZ",
+                    help="Replay a specific episode by restoring its saved RNG state "
+                         "(e.g. data/exp_05/raw/episode_000001.npz). "
+                         "Overrides --seed, --seq, and --n-episodes.")
     ap.add_argument("--n-episodes",   type=int,   default=3,
-                    help="Ignored when --seq is set.")
+                    help="Ignored when --seq or --from-episode is set.")
     ap.add_argument("--time-scale",   type=int,   default=1,
                     help="Multiply each waypoint's n_steps by this factor (e.g. 3 = 3× slower).")
     ap.add_argument("--image-size",   type=int,   default=128)
@@ -72,13 +76,26 @@ def parse_args():
 
 def main():
     import traceback as _tb
+    import numpy as _np
     args = parse_args()
 
-    # Resolve sequence settings.
-    if args.seq:
-        seq_cfg       = SEQUENCES[args.seq]
-        n_episodes    = seq_cfg["n_episodes"]
-        forced_seq    = seq_cfg["obj_types"]
+    # --from-episode: replay one specific episode by restoring its RNG state.
+    replay_rng_state = None
+    if args.from_episode:
+        _ep = _np.load(args.from_episode, allow_pickle=True)
+        if "rng_state" not in _ep or _ep["rng_state"].size == 0:
+            raise SystemExit(
+                f"[DEBUG] {args.from_episode} has no rng_state — "
+                "it was collected before RNG-state saving was added."
+            )
+        replay_rng_state = _ep["rng_state"][0]
+        n_episodes = 1
+        forced_seq = None
+        print(f"[DEBUG] Replaying episode from {args.from_episode}", flush=True)
+    elif args.seq:
+        seq_cfg    = SEQUENCES[args.seq]
+        n_episodes = seq_cfg["n_episodes"]
+        forced_seq = seq_cfg["obj_types"]
         print(f"[DEBUG] Running predefined sequence '{args.seq}': "
               f"{' → '.join(forced_seq)}", flush=True)
     else:
@@ -91,7 +108,7 @@ def main():
 
     _failed = False
     try:
-        DataCollector(
+        collector = DataCollector(
             raw_dir    = "/tmp/debug_run_scratch",
             task       = PickAndPlaceTask(
                 pick_x       = tuple(args.pick_x),
@@ -112,7 +129,10 @@ def main():
             time_scale           = args.time_scale,
             gripper_wait_steps   = int(args.gripper_wait_sec * 60),
             show_colliders       = True,
-        ).run()
+        )
+        if replay_rng_state is not None:
+            collector.rng.bit_generator.state = replay_rng_state
+        collector.run()
     except Exception:
         print("\n[DEBUG] ── FATAL ERROR ──────────────────────────", flush=True)
         _tb.print_exc()

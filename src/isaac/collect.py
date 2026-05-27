@@ -38,12 +38,13 @@ class EpisodeBuffer:
         self._actions.append(action.astype(np.float32))
         self._instr = instruction
 
-    def save(self, path: Path):
+    def save(self, path: Path, rng_state: dict = None):
         np.savez_compressed(
             path,
             images      = np.stack(self._images,  axis=0),
             actions     = np.stack(self._actions, axis=0),
             instruction = self._instr,
+            rng_state   = np.array([rng_state], dtype=object) if rng_state is not None else np.array([]),
         )
 
     def __len__(self):
@@ -103,6 +104,11 @@ class DataCollector:
         self.gripper_wait_steps  = gripper_wait_steps
         self.show_colliders      = show_colliders
         self.raw_dir.mkdir(parents=True, exist_ok=True)
+        import json as _json, datetime as _dt
+        _meta_path = self.raw_dir.parent / "run_meta.json"
+        if not _meta_path.exists():
+            _json.dump({"seed": seed, "started": _dt.datetime.utcnow().isoformat()},
+                       _meta_path.open("w"), indent=2)
 
     # ── run ───────────────────────────────────────────────────────────────────
 
@@ -297,6 +303,7 @@ class DataCollector:
         MAX_FAILURES = 20
 
         while ep_idx < self.n_episodes:
+            _ep_rng_state = self.rng.bit_generator.state
             force_type = (
                 self.forced_obj_sequence[ep_idx % len(self.forced_obj_sequence)]
                 if self.forced_obj_sequence else None
@@ -417,9 +424,23 @@ class DataCollector:
                         _gripper_close_this_wp = True
                     else:
                         gripper.open()
-                        # 20-frame physics dwell lets suction release cleanly
-                        # before the arm begins its retract motion.
+                        # 20-frame physics dwell: hold arm position and keep
+                        # sync_to_link6 active so the kinematic gripper body
+                        # doesn't freeze while the D6 joint spring dissipates.
                         for _ in range(20):
+                            _od_pos, _od_rot = ik.compute_forward_kinematics(
+                                self.EE_FRAME, robot.get_joint_positions()
+                            )
+                            _od_l6   = robot_world_pos + robot_R @ _od_pos
+                            _od_xyzw = Rotation.from_matrix(robot_R @ _od_rot).as_quat()
+                            gripper.sync_to_link6(
+                                world_pos       = _od_l6,
+                                world_quat_wxyz = np.array([_od_xyzw[3], _od_xyzw[0],
+                                                            _od_xyzw[1], _od_xyzw[2]]),
+                            )
+                            robot.get_articulation_controller().apply_action(
+                                ArticulationAction(joint_positions=wp.position)
+                            )
                             world.step(render=True)
                     _prev_gripper = wp.gripper
 
@@ -602,23 +623,28 @@ class DataCollector:
                         _rc_tcp = robot_world_pos + robot_R @ (
                             _rc_pos + _rc_rot @ np.array([0.0, 0.0, 0.215])
                         )
+                        _rc_dir = (robot_R @ _rc_rot) @ np.array([0.0, 0.0, 1.0])
                         _rc_hit = _gpsqi().raycast_closest(
                             carb.Float3(_rc_tcp[0], _rc_tcp[1], _rc_tcp[2]),
-                            carb.Float3(0.0, 0.0, -1.0),
+                            carb.Float3(float(_rc_dir[0]), float(_rc_dir[1]), float(_rc_dir[2])),
                             0.15,
                         )
                         print(f"[RAYCAST-DIAG] origin={_rc_tcp.round(4)}", flush=True)
+                        print(f"[RAYCAST-DIAG] dir={_rc_dir.round(4)}", flush=True)
                         print(f"[RAYCAST-DIAG] hit={_rc_hit}", flush=True)
                     except Exception as _e:
                         print(f"[RAYCAST-DIAG] error: {_e}", flush=True)
+                        _rc_dir = None
                     # ─────────────────────────────────────────────────────────
 
-                    # Print actual scan direction so we can confirm the EEF
-                    # is pointing straight down (not tilted) before scanning.
-                    _sd_pos, _sd_rot = ik.compute_forward_kinematics(
-                        self.EE_FRAME, robot.get_joint_positions()
-                    )
-                    _sd_dir = (robot_R @ _sd_rot) @ np.array([0.0, 0.0, 1.0])
+                    # Print EEF approach direction (reuse FK result from raycast if available).
+                    if _rc_dir is not None:
+                        _sd_dir = _rc_dir
+                    else:
+                        _, _sd_rot = ik.compute_forward_kinematics(
+                            self.EE_FRAME, robot.get_joint_positions()
+                        )
+                        _sd_dir = (robot_R @ _sd_rot) @ np.array([0.0, 0.0, 1.0])
                     print(f"[GRIPPER-WAIT] scan_dir at Phase 2 = {_sd_dir.round(4)}", flush=True)
 
                     print(f"[GRIPPER-WAIT] Phase 2: gripping {_grip_steps} steps "
@@ -676,6 +702,16 @@ class DataCollector:
 
             # Settle at home — PD controller needs extra frames to physically
             # reach the commanded position after the last Lerp step.
+            # Zero joint velocities first: the large multi-joint swings during
+            # return-home leave residual velocity that can drive a wrist joint
+            # (e.g. J5) through an unexpected arc when the ArticulationAction
+            # switches from the ramp target to the absolute HOME_POS value.
+            robot.get_articulation_controller().apply_action(
+                ArticulationAction(
+                    joint_positions=self.HOME_POS,
+                    joint_velocities=np.zeros(n_dof),
+                )
+            )
             for _ in range(self.HOME_SETTLE):
                 robot.get_articulation_controller().apply_action(
                     ArticulationAction(joint_positions=self.HOME_POS)
@@ -692,7 +728,8 @@ class DataCollector:
                       f"steps={len(buf)}  obj={obj_type}  {dims}  '{instruction}'",
                       flush=True)
                 if not self.dry_run:
-                    buf.save(self.raw_dir / f"episode_{ep_idx - 1:06d}.npz")
+                    buf.save(self.raw_dir / f"episode_{ep_idx - 1:06d}.npz",
+                             rng_state=_ep_rng_state)
             else:
                 consecutive_failures += 1
                 if consecutive_failures >= MAX_FAILURES:
