@@ -243,6 +243,7 @@ class PickAndPlaceTask:
         lift_h:         float = 0.20,
         approach:       float = 0.05,
         min_separation: float = 0.10,
+        min_reach_xy:   float = 0.65,
         max_reach_xy:   float = 1.65,
         eef_z_offset:   float = 0.195,
         instructions:   Optional[List[str]] = None,
@@ -256,6 +257,7 @@ class PickAndPlaceTask:
         self.lift_h       = lift_h
         self.approach     = approach
         self.min_sep      = min_separation
+        self.min_reach_xy = min_reach_xy
         self.max_reach_xy = max_reach_xy
         self.eef_z_offset = eef_z_offset
         self.instructions = instructions or self.DEFAULT_INSTRUCTIONS
@@ -263,7 +265,8 @@ class PickAndPlaceTask:
     def _sample_xy(self, rng, x_range, y_range) -> np.ndarray:
         for _ in range(500):
             xy = np.array([rng.uniform(*x_range), rng.uniform(*y_range)])
-            if np.linalg.norm(xy) <= self.max_reach_xy:
+            r = np.linalg.norm(xy)
+            if self.min_reach_xy <= r <= self.max_reach_xy:
                 return xy
         return np.array([(x_range[0]+x_range[1])/2, (y_range[0]+y_range[1])/2])
 

@@ -882,10 +882,14 @@ class DataCollector:
         """Create static collision slabs for the SortingTask target platforms.
 
         Must be called BEFORE world.reset() so PhysX compiles them as static
-        (kinematic-less) colliders.  Each platform is a UsdGeom.Cube with
-        CollisionAPI but no RigidBodyAPI — immovable, zero mass, objects rest on top.
-        Collision with the robot arm is filtered out to avoid constraint stiffness
-        interfering with the IK-driven trajectories.
+        (kinematic-less) colliders.  Platforms have no RigidBodyAPI — immovable,
+        zero mass, objects rest on top.  Collision with the robot arm is filtered
+        to avoid constraint stiffness interfering with IK-driven trajectories.
+
+        Shapes:
+          cube     — flat UsdGeom.Cube  (L × W × H from SORT_PLATFORM_DIMS)
+          cylinder — flat UsdGeom.Cylinder (radius = dims[0]/2, height = dims[2])
+          pyramid  — flat UsdGeom.Cube
         """
         from pxr import UsdGeom, UsdPhysics, Gf, Sdf
 
@@ -893,22 +897,36 @@ class DataCollector:
                        "link_1", "link_2", "link_3",
                        "link_4", "link_5", "link_6")
 
+        grey = [Gf.Vec3f(0.55, 0.55, 0.55)]
+
         for obj_name in ('cube', 'cylinder', 'pyramid'):
             centre = SORT_PLATFORM_CENTRES[obj_name]
             dims   = SORT_PLATFORM_DIMS[obj_name]
             path   = f"/World/SortPlatform_{obj_name}"
 
-            # Cube prim: size=1.0 so scale ops set the actual dimensions.
-            cube = UsdGeom.Cube.Define(stage, path)
-            cube.GetSizeAttr().Set(1.0)
-            prim = stage.GetPrimAtPath(path)
-
-            UsdGeom.Xformable(prim).AddTranslateOp().Set(
-                Gf.Vec3d(float(centre[0]), float(centre[1]), float(centre[2]))
-            )
-            UsdGeom.Xformable(prim).AddScaleOp().Set(
-                Gf.Vec3f(float(dims[0]), float(dims[1]), float(dims[2]))
-            )
+            if obj_name == 'cylinder':
+                # Cylindrical platform — radius = half the XY diameter, axis = Z.
+                cyl = UsdGeom.Cylinder.Define(stage, path)
+                cyl.GetRadiusAttr().Set(float(dims[0]) / 2.0)
+                cyl.GetHeightAttr().Set(float(dims[2]))
+                cyl.GetAxisAttr().Set('Z')
+                prim = stage.GetPrimAtPath(path)
+                UsdGeom.Xformable(prim).AddTranslateOp().Set(
+                    Gf.Vec3d(float(centre[0]), float(centre[1]), float(centre[2]))
+                )
+                cyl.GetDisplayColorAttr().Set(grey)
+            else:
+                # Flat cube platform — size=1 so scale sets actual dimensions.
+                cube = UsdGeom.Cube.Define(stage, path)
+                cube.GetSizeAttr().Set(1.0)
+                prim = stage.GetPrimAtPath(path)
+                UsdGeom.Xformable(prim).AddTranslateOp().Set(
+                    Gf.Vec3d(float(centre[0]), float(centre[1]), float(centre[2]))
+                )
+                UsdGeom.Xformable(prim).AddScaleOp().Set(
+                    Gf.Vec3f(float(dims[0]), float(dims[1]), float(dims[2]))
+                )
+                cube.GetDisplayColorAttr().Set(grey)
 
             # Static collider — no RigidBodyAPI → immovable.
             UsdPhysics.CollisionAPI.Apply(prim)
@@ -919,8 +937,6 @@ class DataCollector:
                 fpairs.GetFilteredPairsRel().AddTarget(
                     Sdf.Path(f"/World/h2017/{lk}")
                 )
-
-            cube.GetDisplayColorAttr().Set([Gf.Vec3f(0.55, 0.55, 0.55)])
 
         print("[COLLECT] Sort platforms created (cube / cylinder / pyramid)", flush=True)
 
@@ -944,10 +960,13 @@ def parse_args():
     ap.add_argument("--place-x",      type=float, nargs=2, default=[-0.95, 0.85])
     ap.add_argument("--place-y",      type=float, nargs=2, default=[-1.55, -1.0])
     ap.add_argument("--place-z",      type=float, default=0.85)
+    ap.add_argument("--min-reach-xy",      type=float, default=0.65)
     ap.add_argument("--max-reach-xy",      type=float, default=1.65)
     ap.add_argument("--eef-z-offset",      type=float, default=0.215)
     ap.add_argument("--gripper-wait-steps", type=int,  default=60,
                     help="Steps to hold at pick and retry gripper close (default 60).")
+    ap.add_argument("--task-type", choices=["random", "sorting"], default="random",
+                    help="Task mode: 'random' (PickAndPlaceTask) or 'sorting' (SortingTask).")
     return ap.parse_args()
 
 
@@ -955,21 +974,24 @@ def main():
     import traceback as _tb
     args = parse_args()
     from isaacsim import SimulationApp
-    simulation_app = SimulationApp({"headless": False})
+    simulation_app = SimulationApp({"headless": True})
     _failed = False
     try:
+        task_kwargs = dict(
+            pick_x       = tuple(args.pick_x),
+            pick_y       = tuple(args.pick_y),
+            surface_z    = args.surface_z,
+            place_x      = tuple(args.place_x),
+            place_y      = tuple(args.place_y),
+            place_z      = args.place_z,
+            min_reach_xy = args.min_reach_xy,
+            max_reach_xy = args.max_reach_xy,
+            eef_z_offset = args.eef_z_offset,
+        )
+        task = SortingTask(**task_kwargs) if args.task_type == "sorting" else PickAndPlaceTask(**task_kwargs)
         DataCollector(
             raw_dir    = args.output_dir,
-            task       = PickAndPlaceTask(
-                pick_x       = tuple(args.pick_x),
-                pick_y       = tuple(args.pick_y),
-                surface_z    = args.surface_z,
-                place_x      = tuple(args.place_x),
-                place_y      = tuple(args.place_y),
-                place_z      = args.place_z,
-                max_reach_xy = args.max_reach_xy,
-                eef_z_offset = args.eef_z_offset,
-            ),
+            task       = task,
             n_episodes          = args.n_episodes,
             image_size          = args.image_size,
             seed                = args.seed,
