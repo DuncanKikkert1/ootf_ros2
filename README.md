@@ -13,11 +13,13 @@ the resulting policy drives the robot in simulation or on the real hardware.
 
 ```
 Isaac Sim (headless)
-  └─ collect.py          Scripted pick-and-place with Replicator domain randomisation
-       │  random cube / cylinder / pyramid per episode; inactive objects parked underground
-       │  waypoints adapt per object type (height, approach clearance, grip dwell)
-       │  EEF orientation fixed straight-down throughout → orientation preserved on conveyor
-       │  saves .npz episodes  (images, actions, instruction)
+  └─ collect.py          Scripted episodes with Replicator domain randomisation
+       │  two task modes (see Task modes below):
+       │    PickAndPlaceTask  — random pick + random place anywhere on conveyor
+       │    SortingTask       — random pick + fixed per-object platform on belt
+       │  inactive objects parked underground; SMC two-cup surface gripper
+       │  EEF approach: straight-down for cube/cylinder, face-normal for pyramid
+       │  saves .npz episodes  (images, actions, instruction, rng_state)
        ▼
   tfds_builder.py        Converts .npz → TFDS dataset  (ootf_synthetic)
        │
@@ -27,6 +29,13 @@ Isaac Sim (headless)
        ▼
   data/<exp>/checkpoint/octo_finetune/experiment_<timestamp>/
 ```
+
+### Task modes
+
+| Mode | Class | Place behaviour |
+|---|---|---|
+| `random` | `PickAndPlaceTask` | Place position sampled uniformly from a configurable XY region |
+| `sorting` | `SortingTask` | Each object type has a fixed target platform on the belt (cube x=−0.5, cylinder x=0, pyramid x=0.5; all at y=−1.28, z=0.855 m) |
 
 ### Sim inference
 
@@ -72,7 +81,7 @@ ootf_ros2/
 │   ├── isaac/
 │   │   ├── collect.py              Headless episode collection in Isaac Sim
 │   │   ├── sim_node.py             Isaac Sim ROS2 node (inference-time)
-│   │   ├── task.py                 Pick-and-place task definition and waypoint sampling
+│   │   ├── task.py                 PickAndPlaceTask + SortingTask; LULA IK waypoint sampling
 │   │   └── gripper.py              SMC two-cup surface gripper controller (Isaac SurfaceGripper)
 │   ├── vla/
 │   │   ├── octo_policy.py          Octo model wrapper (inference)
@@ -207,6 +216,16 @@ Run individual phases:
 ./run.sh debug bridge              # start TCP→ROS2 bridge in isolation
 ./run.sh debug joint               # start Doosan joint client in isolation
 ./run.sh debug gripper-test        # open/close gripper while sim is running
+
+# Dry-run episode collector — visualises trajectories without writing .npz files
+./run.sh debug collect                                    # 3 random episodes
+./run.sh debug collect --seq seq1                         # 1 cube episode
+./run.sh debug collect --seq seq2                         # 1 cylinder episode
+./run.sh debug collect --seq seq3                         # 1 pyramid episode
+./run.sh debug collect --seq seq4                         # cube → cylinder → pyramid
+./run.sh debug collect --task-type sorting --seq seq4     # sorting task, all three
+./run.sh debug collect --seq seq4 --seed 7                # reproducible seed
+./run.sh debug collect --from-episode data/exp/raw/episode_000001.npz  # replay
 ```
 
 Runtime logs for `sim`, `bridge`, and `joint` are saved to `debug/logs/` with a
