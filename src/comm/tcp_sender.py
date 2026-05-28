@@ -1,34 +1,17 @@
-# =============================================================================
-# Name        : tcp_sender.py
-# Author      : Duncan Kikkert
-# Created     : 16/4/2026
-# Description : Persistent TCP client that sends EEF delta actions to a
-#               receiver (tcp_receiver.py or a downstream robot bridge).
+# tcp_sender.py — Persistent TCP client for sending 7-DOF EEF delta actions.
 #
 # Message format (newline-terminated, 7 semicolon-separated floats):
 #   dx;dy;dz;drx;dry;drz;gripper\n
 #
-# Example:
-#   0.001234;-0.000567;0.002100;0.000100;-0.000050;0.000300;0.450000
-#
 # Usage:
 #   with EEFDeltaSender('127.0.0.1', 9001) as sender:
 #       sender.send(action)
-# =============================================================================
 
 import socket
 
 
 class ROS2EEFPublisher:
-    """Publishes 7-DOF EEF delta actions to a ROS2 topic (std_msgs/Float64MultiArray).
-
-    Drops in as a replacement for EEFDeltaSender when running in vla mode,
-    so Isaac Sim can receive deltas directly without a TCP hop.
-
-    Usage:
-        with ROS2EEFPublisher("/eef_delta") as pub:
-            pub.send(action)   # action: [dx, dy, dz, drx, dry, drz, gripper]
-    """
+    """Publishes 7-DOF EEF delta actions to a ROS2 Float64MultiArray topic."""
 
     def __init__(self, topic: str = "/eef_delta"):
         self.topic  = topic
@@ -36,6 +19,7 @@ class ROS2EEFPublisher:
         self._pub   = None
 
     def connect(self):
+        """Initialise ROS2 and create the publisher node."""
         import rclpy
         from std_msgs.msg import Float64MultiArray
         if not rclpy.ok():
@@ -44,13 +28,15 @@ class ROS2EEFPublisher:
         self._pub  = self._node.create_publisher(Float64MultiArray, self.topic, 10)
         print(f"[ROS2] Publishing EEF deltas on {self.topic}")
 
-    def send(self, action):
+    def send(self, action) -> None:
+        """Publish a 7-value EEF delta action as a Float64MultiArray message."""
         from std_msgs.msg import Float64MultiArray
         msg      = Float64MultiArray()
         msg.data = [float(v) for v in action]
         self._pub.publish(msg)
 
     def close(self):
+        """Destroy the publisher node."""
         if self._node is not None:
             self._node.destroy_node()
             self._node = None
@@ -75,16 +61,14 @@ class EEFDeltaSender:
         self.port  = port
         self._sock = None
 
-    # ------------------------------------------------------------------
-    # Connection management
-    # ------------------------------------------------------------------
-
     def connect(self):
+        """Open the TCP connection."""
         self._sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
         self._sock.connect((self.host, self.port))
         print(f"[TCP] Connected to {self.host}:{self.port}")
 
     def close(self):
+        """Close the TCP connection."""
         if self._sock:
             self._sock.close()
             self._sock = None
@@ -97,16 +81,8 @@ class EEFDeltaSender:
     def __exit__(self, *_):
         self.close()
 
-    # ------------------------------------------------------------------
-    # Sending
-    # ------------------------------------------------------------------
-
-    def send(self, action):
-        """Send a 7-value EEF delta action.
-
-        Args:
-            action: array-like of length 7 — [dx, dy, dz, drx, dry, drz, gripper]
-        """
+    def send(self, action) -> None:
+        """Send a 7-value EEF delta action as a semicolon-separated string."""
         if self._sock is None:
             raise RuntimeError("Not connected. Call connect() or use as a context manager.")
 

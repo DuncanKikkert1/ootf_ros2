@@ -1,10 +1,11 @@
-"""Custom Octo finetune config for ootf_synthetic dataset."""
+# finetune_config.py — Octo finetune configuration for the ootf_synthetic dataset.
 
 from ml_collections import ConfigDict
 from ml_collections.config_dict import FieldReference, placeholder
 
 
-def get_config(config_string="head_mlp_only,text_conditioned"):
+def get_config(config_string: str = "head_mlp_only,text_conditioned") -> ConfigDict:
+    """Build the ml_collections config for the given finetune mode and task type."""
     mode, task = config_string.split(",")
     assert task in ["image_conditioned", "text_conditioned", "multimodal"]
     assert mode in ["full", "head_only", "head_mlp_only"]
@@ -41,7 +42,7 @@ def get_config(config_string="head_mlp_only,text_conditioned"):
         pretrained_path=placeholder(str),
         pretrained_step=placeholder(int),
         batch_size=32,
-        shuffle_buffer_size=10000,
+        shuffle_buffer_size=50000,
         num_steps=max_steps,
         log_interval=100,
         eval_interval=5000,

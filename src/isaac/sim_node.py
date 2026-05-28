@@ -1,3 +1,9 @@
+# sim_node.py — Isaac Sim ROS2 node for live Octo inference.
+#
+# Loads the robot scene, subscribes to /eef_delta and /joint_command,
+# runs IK to convert EEF deltas to joint positions, and publishes
+# /joint_states and /mecheye/color camera frames.
+
 from pathlib import Path
 from isaacsim import SimulationApp
 
@@ -35,23 +41,22 @@ URDF_PATH      = Path(__file__).parent.parent.parent / "scenes" / "h2017" / "urd
 LULA_DESC      = Path(__file__).parent.parent.parent / "scenes" / "h2017" / "urdf" / "h2017_lula.yaml"
 JOINT_NAMES    = ['joint_1', 'joint_2', 'joint_3', 'joint_4', 'joint_5', 'joint_6']
 HOME_POSITION  = [0.0, 0.0, 1.57, 0.0, 1.57, 0.0]
-MAX_POS        = 0.05   # metres per step — EEF delta safety clamp
-MAX_ROT        = 0.05   # radians per step (~2.9° — tighter to prevent outlier spasms)
+MAX_POS        = 0.05   # m — EEF delta safety clamp per step
+MAX_ROT        = 0.05   # rad — tighter than translation to prevent outlier spasms
 ROT_EMA_ALPHA  = 0.5    # EMA smoothing for rotation — blends new prediction with previous
 
-# Pickable cube reset — fill in the prim path and world position of the cube
-# so that /reset_scene teleports it back to the pick position.
-# Find the prim path by clicking the cube in the Isaac Sim stage panel.
-PICKUP_PRIM_PATH = "/World/Pickables/Cube"
-PICKUP_POSITION  = [1.04598, 0.53071, 0.47985]
-PICKUP_ORIENT_WXYZ = [1.0, 0.0, 0.0, 0.0]    # identity — no rotation
+# Pickable cube reset — set PICKUP_PRIM_PATH and PICKUP_POSITION to the cube
+# in your scene so /reset_scene can teleport it back to the pick position.
+PICKUP_PRIM_PATH    = "/World/Pickables/Cube"
+PICKUP_POSITION     = [1.04598, 0.53071, 0.47985]
+PICKUP_ORIENT_WXYZ  = [1.0, 0.0, 0.0, 0.0]    # identity — no rotation
 
 # -----------------------------------------------------------------------------
-# Scene preprocessing — strip OmniGraph prims from the USD before loading.
-# RemovePrim() is required: SetActive(False) does not stop the Kit OmniGraph
-# runtime from executing the nodes, which crashes omni.graph.image.core while
-# Fabric is still syncing robot mesh prims.
+# Scene preprocessing
 # -----------------------------------------------------------------------------
+# RemovePrim() is required rather than SetActive(False): the Kit OmniGraph
+# runtime keeps executing disabled nodes, which crashes omni.graph.image.core
+# while Fabric is still syncing robot mesh prims.
 _RAW_SCENE   = Path(__file__).parent.parent.parent / "scenes" / "usd" / "sim2.usd"
 _CLEAN_SCENE = _RAW_SCENE.parent / (_RAW_SCENE.stem + "_sim.usd")
 
@@ -67,10 +72,8 @@ if (not _CLEAN_SCENE.exists() or
 else:
     print(f"[SCENE] Using cached {_CLEAN_SCENE.name}")
 
-# -----------------------------------------------------------------------------
-# Stage loading — poll without update() so omni.graph.image.core is never
-# triggered while Fabric is still syncing prims from USD sublayers.
-# -----------------------------------------------------------------------------
+# Poll without update() so omni.graph.image.core is never triggered while
+# Fabric is still syncing prims from USD sublayers.
 omni.usd.get_context().open_stage(str(_CLEAN_SCENE))
 
 print("[SCENE] Waiting for stage to load...")
@@ -117,7 +120,6 @@ print(f"[ROBOT] {robot.num_dof} DOF")
 # Surface gripper — Phase 2: bind to PhysX runtime AFTER world.reset()
 gripper.acquire_interface()
 
-# Pickable cube — used by /reset_scene to teleport the block back
 _pickup_cube = None
 _stage = omni.usd.get_context().get_stage()
 if _stage.GetPrimAtPath(PICKUP_PRIM_PATH).IsValid():
@@ -153,6 +155,7 @@ print("[CAMERA] Ready")
 # LULA IK solver
 # -----------------------------------------------------------------------------
 def _generate_lula_description(urdf_path: Path, output_path: Path):
+    """Parse the URDF and write a minimal LULA kinematics description."""
     import xml.etree.ElementTree as ET
     root = ET.parse(str(urdf_path)).getroot()
     joints, root_link = [], None
@@ -189,7 +192,10 @@ print(f"[IK] LULA solver ready — end-effector frame: {EE_FRAME}")
 # ROS2 node
 # -----------------------------------------------------------------------------
 class RobotROSNode(Node):
+    """ROS2 node bridging Isaac Sim physics with /eef_delta and /joint_command."""
+
     def __init__(self):
+        """Subscribe to control topics and advertise state + camera topics."""
         super().__init__('h2017_ros_node')
         self.joint_positions  = None
         self.eef_delta        = None
@@ -203,20 +209,21 @@ class RobotROSNode(Node):
         self.gripper_publisher = self.create_publisher(String,     '/gripper_status',  1)
         self.get_logger().info("ROS2 node ready")
 
-    def _joint_cb(self, msg):
+    def _joint_cb(self, msg: JointState) -> None:
         self.joint_positions = list(msg.position)
 
-    def _eef_delta_cb(self, msg):
+    def _eef_delta_cb(self, msg: Float64MultiArray) -> None:
         if len(msg.data) >= 6:
             self.eef_delta = list(msg.data)
             # 7th element (index 6) carries the gripper command if present
             if len(msg.data) >= 7:
                 self.gripper_cmd = float(msg.data[6])
 
-    def _reset_cb(self, _msg):
+    def _reset_cb(self, _msg: Empty) -> None:
         self.do_reset = True
 
     def publish_joint_states(self, positions, velocities, efforts):
+        """Publish current joint state to /joint_states."""
         msg = JointState()
         msg.header.stamp = self.get_clock().now().to_msg()
         msg.name     = JOINT_NAMES
@@ -226,6 +233,7 @@ class RobotROSNode(Node):
         self.state_publisher.publish(msg)
 
     def publish_camera(self, rgb: np.ndarray):
+        """Publish an RGB frame to /mecheye/color."""
         msg = Image()
         msg.header.stamp = self.get_clock().now().to_msg()
         msg.height   = rgb.shape[0]
@@ -253,10 +261,10 @@ _loop_count    = 0
 while simulation_app.is_running():
     rclpy.spin_once(ros_node, timeout_sec=0)
 
-    # Gripper command.  The extension does NOT self-maintain Closing state
-    # between physics steps — close_gripper() must be called every step to
-    # keep the raycast alive.  RETRY_INTERVAL gates how often it scans, not
-    # a self-managed timer.  open() is one-shot (transition only).
+    # The extension does NOT self-maintain Closing state between physics steps —
+    # close_gripper() must be called every step to keep the raycast alive.
+    # RETRY_INTERVAL gates scan frequency, not a self-managed timer.
+    # open() is one-shot (transition only).
     if ros_node.gripper_cmd is not None:
         cmd = ros_node.gripper_cmd
         ros_node.gripper_cmd = None
@@ -317,7 +325,6 @@ while simulation_app.is_running():
         efforts=robot.get_applied_joint_efforts(),
     )
 
-    # Scene reset: teleport cube back to pick position
     if ros_node.do_reset:
         ros_node.do_reset = False
         if _pickup_cube is not None:
@@ -370,7 +377,6 @@ while simulation_app.is_running():
                 print(f"[GRIPPER-DIAG] cup{_i} tip  WORLD: {_t_w.round(4)}")
                 print(f"[GRIPPER-DIAG] cup{_i} scan dir  : {_scan_dir_w.round(4)}")
                 print(f"[GRIPPER-DIAG] cup{_i} scan end  : {_scan_end_w.round(4)}")
-                # Direct PhysX raycast — reports what is actually in the scan path
                 try:
                     import omni.physx as _physx_mod
                     import carb as _carb_mod

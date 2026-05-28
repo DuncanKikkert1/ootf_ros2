@@ -2,29 +2,28 @@
 # pipeline.py — Training pipeline: .npz episodes → TFDS → Octo finetune.
 #
 # Usage:
-#   # Full pipeline (convert + finetune):
 #   python src/training/pipeline.py --raw-dir data/exp_01/raw --output-dir data/exp_01
-#
-#   # Convert only:
-#   python src/training/pipeline.py --raw-dir data/exp_01/raw --output-dir data/exp_01 --convert-only
-#
-#   # Finetune on previously converted data:
-#   python src/training/pipeline.py --raw-dir data/exp_01/raw --output-dir data/exp_01 --finetune-only
+#   python src/training/pipeline.py --raw-dir ... --output-dir ... --convert-only
+#   python src/training/pipeline.py --raw-dir ... --output-dir ... --finetune-only
 # =============================================================================
 
 import argparse
 import os
 import subprocess
 import sys
+from argparse import Namespace
 from pathlib import Path
 
 
 class DatasetConverter:
+    """Converts a directory of .npz episodes to a TFDS dataset."""
+
     def __init__(self, raw_dir: Path, tfds_dir: Path):
         self.raw_dir  = Path(raw_dir)
         self.tfds_dir = Path(tfds_dir)
 
-    def run(self):
+    def run(self) -> None:
+        """Build the TFDS dataset from the raw .npz files."""
         sys.path.insert(0, str(Path(__file__).parent.parent))
         from training.tfds_builder import OotfSyntheticBuilder
 
@@ -41,6 +40,8 @@ class DatasetConverter:
 
 
 class OctoFinetuner:
+    """Launches Octo's finetune.py script against a TFDS dataset."""
+
     DEFAULT_OCTO_DIR = Path.home() / "Documents" / "octo"
 
     def __init__(
@@ -61,7 +62,8 @@ class OctoFinetuner:
         self.batch_size      = batch_size
         self.octo_dir        = Path(octo_dir) if octo_dir else self.DEFAULT_OCTO_DIR
 
-    def run(self):
+    def run(self) -> None:
+        """Launch the Octo finetune script as a subprocess."""
         script = self.octo_dir / "scripts" / "finetune.py"
         if not script.exists():
             raise FileNotFoundError(
@@ -97,7 +99,7 @@ class OctoFinetuner:
 # CLI
 # ─────────────────────────────────────────────────────────────────────────────
 
-def parse_args():
+def parse_args() -> Namespace:
     ap = argparse.ArgumentParser(
         description="Convert .npz episodes to TFDS and finetune Octo."
     )
@@ -116,7 +118,7 @@ def parse_args():
     return ap.parse_args()
 
 
-def main():
+def main() -> None:
     args     = parse_args()
     out      = Path(args.output_dir)
     tfds_dir = out / "tfds"
@@ -126,9 +128,8 @@ def main():
         DatasetConverter(raw_dir=args.raw_dir, tfds_dir=tfds_dir).run()
 
     if not args.convert_only:
-        # Octo's finetune script splits data 95% train / 5% val using TFDS
-        # percentage-based sharding. With fewer than 20 episodes the 5% slice
-        # resolves to 0 records, crashing the validation callback setup.
+        # Octo's 95/5 train/val split requires at least 20 episodes — the 5%
+        # slice resolves to 0 records below that, crashing validation setup.
         n_episodes = len(list(Path(args.raw_dir).glob("*.npz")))
         if n_episodes < 20:
             print(

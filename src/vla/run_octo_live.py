@@ -1,27 +1,15 @@
-# =============================================================================
-# Name        : run_octo_live.py
-# Author      : Duncan Kikkert
-# Created     : 16/4/2026
-# Description : Test loop for the Octo VLA pipeline.
-#               Captures frames from the MechEye 3D camera, runs Octo
-#               inference, and sends 7-DOF EEF delta actions via TCP.
+# run_octo_live.py — Live Octo VLA inference loop.
 #
-#               Action format sent: dx;dy;dz;drx;dry;drz;gripper\n
+# Captures frames from a camera (MechEye, USB, or ROS2 topic), runs Octo
+# inference, and sends 7-DOF EEF delta actions via TCP or ROS2 topic.
+# Action format sent: dx;dy;dz;drx;dry;drz;gripper\n
 #
-# Usage examples:
-#   # Language-conditioned (prompted at runtime):
-#   python run_octo_live.py
+# Pipeline: isaac/collect.py → training/pipeline.py (convert + finetune) → this script
 #
-#   # Language-conditioned (instruction via CLI):
+# Usage:
 #   python run_octo_live.py --instruction "pick up the circle"
-#
-#   # Goal-image-conditioned:
 #   python run_octo_live.py --goal-image /path/to/goal.png
-#
-#   # Use a locally finetuned checkpoint:
-#   python run_octo_live.py --model-path /path/to/checkpoint \
-#                           --dataset-name my_dataset
-# =============================================================================
+#   python run_octo_live.py --model-path /path/to/checkpoint --dataset-name my_dataset
 
 import argparse
 import sys
@@ -54,6 +42,7 @@ class USBCamera:
         self._cap   = None
 
     def connect(self):
+        """Open the USB camera and discard warm-up frames."""
         self._cap = cv2.VideoCapture(self.device)
         if not self._cap.isOpened():
             raise RuntimeError(f"Could not open USB camera (device index {self.device}).")
@@ -64,12 +53,14 @@ class USBCamera:
         print(f"[CAM] USB camera opened (device {self.device}).")
 
     def capture_rgb(self) -> np.ndarray:
+        """Capture one frame and return it as HxWx3 RGB uint8."""
         ret, frame_bgr = self._cap.read()
         if not ret:
             raise RuntimeError("USB camera read failed.")
         return cv2.cvtColor(frame_bgr, cv2.COLOR_BGR2RGB)
 
     def close(self):
+        """Release the camera."""
         if self._cap:
             self._cap.release()
             self._cap = None
@@ -105,14 +96,10 @@ DATASET_NAME = "bridge_dataset"
 STEP_DELAY   = 0.2   # seconds between inference steps (~5 Hz)
 
 
-# ------------------------------------------------------------------
-# CLI
-# ------------------------------------------------------------------
-
 def parse_args():
+    """Parse CLI arguments for model, task, camera, and sender configuration."""
     ap = argparse.ArgumentParser(description="Octo VLA live test loop.")
 
-    # Model
     ap.add_argument("--model-path",   type=str, default=None,
                     help="Octo checkpoint path or HF URI (default: latest local finetune, "
                          f"or {MODEL_PATH} if none found)")
@@ -125,24 +112,18 @@ def parse_args():
     ap.add_argument("--window-size",  type=int, default=1,
                     help="Observation history length passed to Octo (default: 1)")
 
-    # Task — mutually exclusive
     task_grp = ap.add_mutually_exclusive_group()
     task_grp.add_argument("--instruction", type=str, default=None,
                           help="Natural-language instruction (language-conditioned mode)")
     task_grp.add_argument("--goal-image",  type=str, default=None,
                           help="Path to a goal image PNG/JPG (goal-conditioned mode)")
 
-    # Camera
     ap.add_argument("--camera-ip",   type=str, default=CAMERA_IP)
     ap.add_argument("--camera-port", type=int, default=CAMERA_PORT)
-
-    # TCP sender
     ap.add_argument("--host", type=str, default=SENDER_HOST,
                     help=f"Receiver host (default: {SENDER_HOST})")
     ap.add_argument("--port", type=int, default=SENDER_PORT,
                     help=f"Receiver port (default: {SENDER_PORT})")
-
-    # Loop control
     ap.add_argument("--steps",      type=int,   default=0,
                     help="Number of steps to run (0 = run until Ctrl+C)")
     ap.add_argument("--step-delay", type=float, default=STEP_DELAY,
@@ -163,14 +144,10 @@ def parse_args():
     return ap.parse_args()
 
 
-# ------------------------------------------------------------------
-# Main
-# ------------------------------------------------------------------
-
 def main():
+    """Resolve model/camera/sender, load Octo, and run the inference loop."""
     args = parse_args()
 
-    # ---- resolve model path and dataset name ----
     if args.model_path is None:
         local_ckpt = _find_latest_checkpoint()
         if local_ckpt:
@@ -185,7 +162,6 @@ def main():
             "ootf_synthetic" if not args.model_path.startswith("hf://") else DATASET_NAME
         )
 
-    # ---- load Octo ----
     policy = OctoPolicy(
         model_path   = args.model_path,
         dataset_name = args.dataset_name,
@@ -193,7 +169,6 @@ def main():
         step         = args.step,
     )
 
-    # ---- set task ----
     if args.goal_image:
         goal_bgr = cv2.imread(args.goal_image)
         if goal_bgr is None:
@@ -231,7 +206,6 @@ def main():
         else:
             sys.exit("[ERR] Invalid choice.")
 
-    # ---- connect camera & TCP sender ----
     if args.dry_run:
         print("[INFO] Dry-run mode — using random noise frames (no camera).")
         camera = None
@@ -264,29 +238,23 @@ def main():
             while True:
                 t0 = time.time()
 
-                # ---- capture frame ----
                 if camera is not None:
                     frame_rgb = camera.capture_rgb()
                 else:
                     frame_rgb = np.random.randint(0, 256, (480, 640, 3), dtype=np.uint8)
 
-                # ---- show live feed (before inference so Qt can paint the frame) ----
                 if args.show_camera:
                     display = cv2.cvtColor(frame_rgb, cv2.COLOR_RGB2BGR)
                     cv2.imshow("Octo — camera feed", display)
                     # Pump the Qt event loop long enough to render the frame,
-                    # then check for 'q'.  The larger waitKey here is what actually
-                    # makes the window refresh; waitKey(1) after slow inference
-                    # doesn't give Qt enough time.
+                    # then check for 'q'.  waitKey(1) after slow inference
+                    # doesn't give Qt enough time to refresh the window.
                     if cv2.waitKey(30) & 0xFF == ord('q'):
                         print("[INFO] 'q' pressed — stopping.")
                         break
 
-                # ---- Octo inference ----
                 action = policy.step(frame_rgb)
-                # action: [dx, dy, dz, drx, dry, drz, gripper]
 
-                # ---- send action ----
                 sender.send(action)
 
                 step += 1
@@ -298,7 +266,6 @@ def main():
                     print(f"[INFO] Reached {args.steps} steps. Done.")
                     break
 
-                # ---- pace the loop ----
                 elapsed = time.time() - t0
                 wait    = args.step_delay - elapsed
                 if wait > 0:

@@ -1,18 +1,10 @@
-# =============================================================================
-# Name        : mech_eye_camera.py
-# Author      : Duncan Kikkert
-# Created     : 16/4/2026
-# Description : MechEye 3D camera interface. Connects to the camera via the
-#               Mech-Eye Python SDK, captures the 2D colour image, and returns
-#               it as an OpenCV-compatible numpy array (HxWx3, RGB).
+# mech_eye_camera.py — MechEye 3D camera interface and ROS2 camera bridge.
 #
-# Install SDK : pip install MechEyeAPI
-#               https://github.com/MechMindRobotics/mecheye_python_samples
+# MechEyeCamera: connects via the Mech-Eye Python SDK, captures 2D colour
+# images, and returns them as HxWx3 RGB uint8 arrays.
+# ROS2Camera: reads from a sensor_msgs/Image topic (drop-in replacement).
 #
-# Usage:
-#   with MechEyeCamera('192.168.137.100', 50005) as cam:
-#       rgb = cam.capture_rgb()   # numpy uint8 HxWx3
-# =============================================================================
+# Install SDK: pip install MechEyeAPI
 
 import time
 
@@ -30,11 +22,8 @@ class MechEyeCamera:
         self.port = port
         self._camera = None
 
-    # ------------------------------------------------------------------
-    # Connection
-    # ------------------------------------------------------------------
-
     def connect(self):
+        """Connect to the camera at the configured IP and port."""
         info            = CameraInfo()
         info.ip_address = self.ip
         info.port       = self.port
@@ -51,6 +40,7 @@ class MechEyeCamera:
         print(f"[CAM] Connected to MechEye at {self.ip}:{self.port}")
 
     def close(self):
+        """Disconnect from the camera."""
         if self._camera is not None:
             self._camera.disconnect()
             self._camera = None
@@ -62,10 +52,6 @@ class MechEyeCamera:
 
     def __exit__(self, *_):
         self.close()
-
-    # ------------------------------------------------------------------
-    # Capture
-    # ------------------------------------------------------------------
 
     def capture_rgb(self) -> np.ndarray:
         """Capture the 2D colour image and return as HxWx3 RGB uint8 array."""
@@ -87,15 +73,7 @@ class MechEyeCamera:
 
 
 class ROS2Camera:
-    """RGB frames from a ROS2 sensor_msgs/Image topic (e.g. Isaac Sim action graph).
-
-    Matches the MechEyeCamera/USBCamera interface so it drops in as a camera
-    source for run_octo_live.py without any other changes.
-
-    Usage:
-        with ROS2Camera("/mecheye/rgb") as cam:
-            rgb = cam.capture_rgb()   # numpy uint8 HxWx3 RGB
-    """
+    """RGB frames from a ROS2 sensor_msgs/Image topic — drop-in for MechEyeCamera."""
 
     def __init__(self, topic: str = "/mecheye/color", timeout: float = 60.0):
         self.topic   = topic
@@ -104,6 +82,7 @@ class ROS2Camera:
         self._latest = None
 
     def connect(self):
+        """Subscribe to the ROS2 image topic."""
         import rclpy
         from sensor_msgs.msg import Image
 
@@ -114,7 +93,8 @@ class ROS2Camera:
         self._node.create_subscription(Image, self.topic, self._callback, 1)
         print(f"[CAM] Subscribed to ROS2 topic: {self.topic}")
 
-    def _callback(self, msg):
+    def _callback(self, msg) -> None:
+        """Store the latest frame, normalising encoding to RGB."""
         import rclpy
         arr = np.frombuffer(msg.data, dtype=np.uint8).reshape(msg.height, msg.width, -1)
         enc = msg.encoding.lower()
@@ -125,6 +105,7 @@ class ROS2Camera:
         self._latest = arr
 
     def capture_rgb(self) -> np.ndarray:
+        """Spin until a frame arrives and return it as HxWx3 RGB uint8."""
         import rclpy
         deadline = time.time() + self.timeout
         last_print = 0.0
@@ -143,6 +124,7 @@ class ROS2Camera:
         return self._latest
 
     def close(self):
+        """Destroy the ROS2 subscriber node."""
         if self._node is not None:
             self._node.destroy_node()
             self._node = None

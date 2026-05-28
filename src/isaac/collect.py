@@ -1,14 +1,11 @@
 # =============================================================================
 # collect.py — Episode collection in Isaac Sim 5.1.0 with Replicator.
 #
-# Three object types are supported:
-#   cube     — 10×10×10 cm DynamicCuboid, straight-down EEF.
-#   cylinder — 10 cm dia × 8 cm DynamicCylinder, straight-down EEF.
-#   pyramid  — true apex pyramid (rectangular base L×W, no flat top).
-#              Dimensions are sampled fresh each episode and the USD mesh is
-#              rebuilt between episodes using force_load_physics_from_usd()
-#              so PhysX picks up the new geometry without a full world.reset().
-#              EEF tilts to the most-horizontal graspable face normal.
+# Three object types: cube (10×10×10 cm, straight-down EEF), cylinder
+# (10 cm dia × 8 cm, straight-down), pyramid (variable L×W×H, face-normal EEF).
+# Pyramid geometry is rebuilt per-episode via force_load_physics_from_usd().
+#
+# Pipeline: this script → training/pipeline.py (convert + finetune) → vla/run_octo_live.py
 #
 # Usage:
 #   bash launch/pipeline.sh --output-dir data/exp_01 --n-episodes 500
@@ -29,17 +26,21 @@ from task import (PickAndPlaceTask, SortingTask, Waypoint, _OBJ_PARAMS,
 # ─────────────────────────────────────────────────────────────────────────────
 
 class EpisodeBuffer:
+    """Per-episode accumulator of image/action/instruction frames."""
+
     def __init__(self):
         self._images:  list = []
         self._actions: list = []
         self._instr:   str  = ""
 
     def add_step(self, image: np.ndarray, action: np.ndarray, instruction: str):
+        """Append one simulation step."""
         self._images.append(image)
         self._actions.append(action.astype(np.float32))
         self._instr = instruction
 
     def save(self, path: Path, rng_state: dict = None):
+        """Write frames to a compressed .npz file."""
         np.savez_compressed(
             path,
             images      = np.stack(self._images,  axis=0),
@@ -57,6 +58,8 @@ class EpisodeBuffer:
 # ─────────────────────────────────────────────────────────────────────────────
 
 class DataCollector:
+    """Collects scripted pick-and-place episodes in Isaac Sim."""
+
     ROBOT_PRIM     = "/World/h2017"
     EE_FRAME       = "link_6"
     WRIST_CAM_PRIM = "/World/h2017/link_6/MechEye/MechEye/Camera"
@@ -72,7 +75,7 @@ class DataCollector:
     }
 
     HOME_POS    = [0.0, 0.0, 1.57, 0.0, 1.57, 0.0]
-    HOME_SETTLE = 60
+    HOME_SETTLE = 60   # frames to wait at home before/after each episode
 
     def __init__(
         self,
@@ -89,10 +92,14 @@ class DataCollector:
         time_scale:          int  = 1,
         gripper_wait_steps:  int  = 60,
         show_colliders:      bool = False,
+        verbose:             bool = False,
     ):
+        """Configure paths, episode count, and randomisation settings."""
         root = Path(__file__).parent.parent.parent
         self.raw_dir             = Path(raw_dir)
+        self.verbose             = verbose
         self.task                = task
+        self.task.verbose        = verbose
         self.n_episodes          = n_episodes
         self.image_size          = image_size
         self.rng                 = np.random.default_rng(seed)
@@ -113,7 +120,12 @@ class DataCollector:
 
     # ── run ───────────────────────────────────────────────────────────────────
 
-    def run(self):
+    def run(self) -> None:
+        """Load the scene, run episodes, and save .npz files.
+
+        Gripper init is split across world.reset(): create_prims() fires before,
+        acquire_interface() after — reversing this order silently breaks PhysX attachment.
+        """
         import carb
         from gripper import SurfaceGripperController
         import omni.usd
@@ -132,12 +144,13 @@ class DataCollector:
         _ag = stage.GetPrimAtPath("/World/ActionGraph")
         if _ag.IsValid():
             _ag.SetActive(False)
-            print("[COLLECT] Disabled /World/ActionGraph", flush=True)
+            if self.verbose:
+                print("[COLLECT] Disabled /World/ActionGraph", flush=True)
 
         # ── Surface gripper (Phase 1: before world.reset) ─────────────────────
         from isaacsim.core.utils.extensions import enable_extension
         enable_extension("isaacsim.robot.surface_gripper")
-        gripper = SurfaceGripperController(verbose=True)
+        gripper = SurfaceGripperController(verbose=self.verbose)
         gripper.create_prims(stage)
         _prev_gripper  = 0.0
         _close_pending = False   # deferred gripper close, fires once arm settles
@@ -171,13 +184,13 @@ class DataCollector:
             mass      = 0.20,
         ))
 
-        # Pyramid is NOT pre-allocated; it is built fresh each episode between
-        # episodes using force_load_physics_from_usd() so its L×W×H can vary.
-
+        # Pyramid is NOT pre-allocated; rebuilt fresh each episode so its L×W×H
+        # can vary without requiring a full world.reset().
         if isinstance(self.task, SortingTask):
             self._create_sort_platforms(stage)
 
-        print("[COLLECT] world.reset() ...", flush=True)
+        if self.verbose:
+            print("[COLLECT] world.reset() ...", flush=True)
         world.reset()
 
         if self.show_colliders:
@@ -185,17 +198,16 @@ class DataCollector:
             _cs = carb.settings.get_settings()
             _cs.set_int("/persistent/physics/visualizationDisplayColliders", 2)
             _cs.set_int("/persistent/physics/visualizationDisplayJoints",    2)
-            print("[COLLECT] Collision + joint visualization enabled (All)", flush=True)
+            if self.verbose:
+                print("[COLLECT] Collision + joint visualization enabled (All)", flush=True)
 
         # ── Surface gripper (Phase 2: after world.reset) ──────────────────────
         gripper.acquire_interface()
 
-        # ── Disable collision on the SMC gripper mesh attached to link_6 ──────
-        # The SMC_gripper mesh under link_6 has active collision geometry.
-        # Its collision shape completely surrounds the cup tips, so every
-        # surface-gripper raycast hits link_6 at distance=0 and never reaches
-        # the pick cube.  Disabling collision on those meshes lets the scan
-        # pass through to the object below.
+        # The SMC_gripper mesh under link_6 has active collision geometry that
+        # completely surrounds the cup tips, causing every surface-gripper raycast
+        # to hit link_6 at distance=0 instead of the object below.  Disabling
+        # collision on those meshes lets the scan pass through to the pick target.
         from pxr import Usd as _Usd
         _smc_root = stage.GetPrimAtPath("/World/h2017/link_6/SMC_gripper")
         _n_disabled = 0
@@ -205,33 +217,34 @@ class DataCollector:
                 if _col.IsValid() and _col.Get():
                     _col.Set(False)
                     _n_disabled += 1
-        print(f"[COLLECT] SMC_gripper collision disabled on {_n_disabled} prim(s)", flush=True)
+        if self.verbose:
+            print(f"[COLLECT] SMC_gripper collision disabled on {_n_disabled} prim(s)", flush=True)
 
-        # ── Park the scene's Pickables/Cube so it never enters the scan path ──
-        # sim2.usd contains /World/Pickables/Cube as a dynamic rigid body.  It
-        # sits at some fixed scene position which may overlap with the pick zone.
-        # Moving it underground prevents the surface gripper from accidentally
-        # attaching to it instead of the episode's /World/pick_cube.
+        # sim2.usd contains /World/Pickables/Cube at a fixed scene position that
+        # may overlap the pick zone.  Parking it underground prevents the surface
+        # gripper from attaching to it instead of the episode's /World/pick_cube.
         from isaacsim.core.prims import SingleRigidPrim as _SRP
         _scene_cube_prim = stage.GetPrimAtPath("/World/Pickables/Cube")
         if _scene_cube_prim.IsValid():
             _sc = _SRP(prim_path="/World/Pickables/Cube", name="scene_cube_park")
             _sc_pos, _ = _sc.get_world_pose()
-            print(f"[COLLECT] /World/Pickables/Cube found at {_sc_pos.round(3)} — parking underground", flush=True)
+            if self.verbose:
+                print(f"[COLLECT] /World/Pickables/Cube found at {_sc_pos.round(3)} — parking underground", flush=True)
             _sc.set_world_pose(position=np.array([0.0, 0.8, -5.0]))
             _sc.set_linear_velocity(np.zeros(3))
             _sc.set_angular_velocity(np.zeros(3))
             world.step(render=False)
         else:
-            print("[COLLECT] /World/Pickables/Cube not in scene — nothing to park", flush=True)
+            if self.verbose:
+                print("[COLLECT] /World/Pickables/Cube not in scene — nothing to park", flush=True)
 
-        print("[COLLECT] wrist_cam.initialize() ...", flush=True)
+        if self.verbose:
+            print("[COLLECT] wrist_cam.initialize() ...", flush=True)
         wrist_cam.initialize()
 
-        # ── Clamp solver velocity iterations to ≤4 to silence TGS warning ──────
         # PhysX TGS solver changed behaviour for velocity_iteration_count > 4.
-        # /World/Pickables/Cube (rigid) and /World/h2017/root_joint (articulation)
-        # both exceed that limit in the USD asset; cap them here after world.reset().
+        # /World/Pickables/Cube and /World/h2017/root_joint both exceed that limit
+        # in the USD asset; cap them here after world.reset() to silence the warning.
         try:
             from pxr import PhysxSchema as _PhysxSchema
 
@@ -239,23 +252,27 @@ class DataCollector:
             if _cube_prim.IsValid():
                 _rb_api = _PhysxSchema.PhysxRigidBodyAPI.Apply(_cube_prim)
                 _rb_api.CreateSolverVelocityIterationCountAttr(1)
-                print("[COLLECT] /World/Pickables/Cube velocity iterations clamped to 1", flush=True)
+                if self.verbose:
+                    print("[COLLECT] /World/Pickables/Cube velocity iterations clamped to 1", flush=True)
 
             _robot_prim = stage.GetPrimAtPath("/World/h2017/root_joint")
             if _robot_prim.IsValid():
                 _art_api = _PhysxSchema.PhysxArticulationAPI.Apply(_robot_prim)
                 _art_api.GetSolverVelocityIterationCountAttr().Set(4)
-                print("[COLLECT] /World/h2017/root_joint velocity iterations clamped to 4", flush=True)
+                if self.verbose:
+                    print("[COLLECT] /World/h2017/root_joint velocity iterations clamped to 4", flush=True)
         except Exception as _e:
-            print(f"[COLLECT] velocity-iteration clamp skipped: {_e}", flush=True)
+            if self.verbose:
+                print(f"[COLLECT] velocity-iteration clamp skipped: {_e}", flush=True)
 
         n_dof = robot.num_dof
         robot.get_articulation_controller().set_gains(
             kps=np.full(n_dof, 1e6), kds=np.full(n_dof, 1e5),
         )
-        print(f"[COLLECT] robot gains set (n_dof={n_dof})", flush=True)
+        if self.verbose:
+            print(f"[COLLECT] robot gains set (n_dof={n_dof})", flush=True)
 
-        self._generate_lula(self.urdf_path, self.lula_desc)
+        self._generate_lula(self.urdf_path, self.lula_desc, verbose=self.verbose)
 
         # Place-zone IK solver seeded toward J1≈-130°, J2≈+60°, J3≈+100° so LULA
         # starts in the elbow-up branch when reaching behind the robot.
@@ -265,6 +282,7 @@ class DataCollector:
         self._generate_lula(
             self.urdf_path, place_lula,
             default_q=list(np.radians([-130.0, 60.0, 100.0, 0.0, 20.0, 0.0])),
+            verbose=self.verbose,
         )
 
         ik = LulaKinematicsSolver(
@@ -275,14 +293,16 @@ class DataCollector:
             robot_description_path=place_lula,
             urdf_path=self.urdf_path,
         )
-        print("[COLLECT] IK solvers ready (pick + place)", flush=True)
+        if self.verbose:
+            print("[COLLECT] IK solvers ready (pick + place)", flush=True)
 
         robot_world_pos, robot_world_quat = robot.get_world_pose()
         rq = robot_world_quat
         robot_R = Rotation.from_quat([rq[1], rq[2], rq[3], rq[0]]).as_matrix()
 
         # ── Replicator (cube + cylinder; pyramid colour set manually) ─────────
-        print("[COLLECT] Replicator setup ...", flush=True)
+        if self.verbose:
+            print("[COLLECT] Replicator setup ...", flush=True)
         with rep.trigger.on_frame():
             with rep.get.light():
                 rep.modify.attribute("inputs:intensity",
@@ -294,7 +314,8 @@ class DataCollector:
                     rep.randomizer.color(
                         colors=rep.distribution.uniform((0,0,0), (1,1,1))
                     )
-        print("[COLLECT] Replicator ready", flush=True)
+        if self.verbose:
+            print("[COLLECT] Replicator ready", flush=True)
 
         # obj_map is updated dynamically when a pyramid episode is encountered.
         obj_map: dict = {'cube': cube, 'cylinder': cylinder}
@@ -321,8 +342,9 @@ class DataCollector:
                                  pick_yaw=_ep_yaw)
 
             if waypoints is None:
-                print(f"[COLLECT] ep {ep_idx}: IK pre-solve failed obj={obj_type} — resampling",
-                      flush=True)
+                if self.verbose:
+                    print(f"[COLLECT] ep {ep_idx}: IK pre-solve failed obj={obj_type} — resampling",
+                          flush=True)
                 consecutive_failures += 1
                 if consecutive_failures >= MAX_FAILURES:
                     raise RuntimeError(
@@ -361,7 +383,6 @@ class DataCollector:
             for _ in range(self.HOME_SETTLE):
                 world.step(render=False)
 
-            # ── Teleport active object to pallet; park the rest ────────────
             # Cube/cylinder yaw was already sampled above and baked into the IK
             # so J6 tracks the cube orientation.  Pyramid uses identity (face normal
             # orientation is handled separately in _build_pyramid_waypoints).
@@ -379,7 +400,7 @@ class DataCollector:
                 obj.set_linear_velocity(np.zeros(3))
                 obj.set_angular_velocity(np.zeros(3))
 
-            # ── Zero robot joint velocities to prevent cross-episode leakage ─
+            # Zero joint velocities to prevent cross-episode velocity leakage.
             robot.get_articulation_controller().apply_action(
                 ArticulationAction(
                     joint_positions=self.HOME_POS,
@@ -389,8 +410,8 @@ class DataCollector:
             for _ in range(5):
                 world.step(render=False)
 
-            # ── Colour-randomise pyramid manually (Replicator doesn't track
-            #    dynamically recreated prims) ─────────────────────────────
+            # Pyramid colour must be set manually — Replicator doesn't track
+            # dynamically recreated prims.
             if obj_type == 'pyramid':
                 self._randomise_pyramid_colour(stage)
 
@@ -471,26 +492,22 @@ class DataCollector:
                         world_quat_wxyz = np.array([_l6_xyzw[3], _l6_xyzw[0],
                                                     _l6_xyzw[1], _l6_xyzw[2]]),
                     )
-                    # Fire close once the arm has settled (~70% into the dwell).
-                    # Firing at the waypoint boundary would scan when the arm is
-                    # still far above the cube (still descending from pre-pick),
-                    # which puts the cup tips outside the 5 cm scan range.
-                    # Wait until 50% of dwell before starting to scan (arm near target).
-                    # Then call close() every step — the surface gripper extension
-                    # requires per-step calls to keep the raycast alive; it does not
-                    # self-maintain Closing state between physics steps.
+                    # Fire close once the arm has settled (~50% into the dwell).
+                    # Firing at the waypoint boundary scans when the arm is still
+                    # descending from pre-pick, putting cup tips outside the 5 cm
+                    # scan range.  The surface gripper extension requires per-step
+                    # calls to keep the raycast alive — it does not self-maintain
+                    # Closing state between physics steps.
                     if _close_pending and s >= int(wp.n_steps * 0.5):
                         _close_pending = False
                         if self.dry_run:
-                            # Print actual scan geometry at the moment scanning starts.
                             _d_pos, _d_rot = ik.compute_forward_kinematics(
                                 self.EE_FRAME, robot.get_joint_positions()
                             )
                             _l6w   = robot_world_pos + robot_R @ _d_pos
                             _Rw    = robot_R @ _d_rot
-                            # Z=0.215 matches _CUP_TIPS in gripper.py
-                            _origA = _l6w + _Rw @ np.array([-0.022, -0.019, 0.215])
-                            _origB = _l6w + _Rw @ np.array([ 0.020,  0.0235, 0.215])
+                            _origA = _l6w + _Rw @ np.array([-0.022, -0.019, 0.215])   # cup A tip offset, m
+                            _origB = _l6w + _Rw @ np.array([ 0.020,  0.0235, 0.215])  # cup B tip offset, m
                             _dir   = _Rw @ np.array([0.0, 0.0, 1.0])
                             _tcp   = _l6w + _Rw @ np.array([0.0, 0.0, 0.215])
                             print(f"[SCAN-DIAG] step={s}  link6_world  = {_l6w.round(4)}", flush=True)
@@ -510,18 +527,15 @@ class DataCollector:
                         if rgba is not None and rgba.ndim >= 3 else None
                     )
 
-                    # Dwell waypoint: same IK target as previous (e.g. pick
-                    # contact → pick dwell).  Use a loose tolerance (0.05 rad
-                    # ≈ 3°) so that even if the arm hasn't fully settled during
-                    # the previous waypoint's hold phase it still holds from
-                    # step 0 instead of re-ramping (which causes visible EEF
-                    # tilt mid-ramp for certain kinematic configurations).
+                    # Dwell waypoint: same IK target as previous (e.g. pick contact →
+                    # pick dwell).  Use 0.05 rad (≈3°) tolerance so a not-fully-settled
+                    # arm still holds from step 0 instead of re-ramping, which causes
+                    # visible EEF tilt mid-ramp for some kinematic configurations.
                     is_dwell = np.allclose(wp.position, start_joints, atol=0.05)
 
-                    # Reserve the last _HOLD_STEPS of every waypoint as a hold
-                    # phase so the PD controller converges before the next
-                    # waypoint starts.  Without this the arm is still in motion
-                    # at waypoint boundaries and never reaches the IK targets.
+                    # Reserve the last _HOLD_STEPS of every waypoint as a hold phase
+                    # so the PD controller converges before the next waypoint starts.
+                    # Without this the arm is still in motion at waypoint boundaries.
                     _HOLD_STEPS = 20
                     _ramp_steps = max(1, wp.n_steps - _HOLD_STEPS)
 
@@ -562,37 +576,36 @@ class DataCollector:
                         buf.add_step(prev_rgb, action.astype(np.float32), instruction)
                     prev_pos, prev_rot, prev_rgb = cur_pos, cur_rot.copy(), cur_rgb
 
-                # After the arm fully arrives at the pick dwell, hold position and
-                # retry gripper.close() for gripper_wait_steps steps before retract.
-                # Mirrors GRIP_WAIT_SEC in the gripper test.
+                # After the arm arrives at the pick dwell, hold position and retry
+                # gripper.close() for gripper_wait_steps steps before retract.
                 if _gripper_close_this_wp and self.gripper_wait_steps > 0:
-                    # Diagnostic: show TCP tip world position vs object center so we
-                    # can verify the scan origin is above (not inside) the object.
                     _w_pos, _w_rot = ik.compute_forward_kinematics(
                         self.EE_FRAME, robot.get_joint_positions()
                     )
                     _w_l6   = robot_world_pos + robot_R @ _w_pos
                     _w_Rw   = robot_R @ _w_rot
-                    _w_tcp  = _w_l6 + _w_Rw @ np.array([0.0, 0.0, 0.215])
+                    _w_tcp  = _w_l6 + _w_Rw @ np.array([0.0, 0.0, 0.215])   # cup tip, 0.215 m along link_6 +Z
                     _w_obj  = obj_map.get(obj_type)
                     _w_obj_z = _w_obj.get_world_pose()[0][2] if _w_obj is not None else float('nan')
-                    print(f"[GRIPPER-WAIT] TCP_tip   = {_w_tcp.round(4)}", flush=True)
-                    print(f"[GRIPPER-WAIT] obj_ctr_z = {_w_obj_z:.4f}  "
-                          f"TCP_z - obj_z = {(_w_tcp[2] - _w_obj_z):.4f} m", flush=True)
-                    print(f"[GRIPPER-WAIT] status before wait = {gripper.status()}", flush=True)
+                    if self.verbose:
+                        print(f"[GRIPPER-WAIT] TCP_tip   = {_w_tcp.round(4)}", flush=True)
+                        print(f"[GRIPPER-WAIT] obj_ctr_z = {_w_obj_z:.4f}  "
+                              f"TCP_z - obj_z = {(_w_tcp[2] - _w_obj_z):.4f} m", flush=True)
+                        print(f"[GRIPPER-WAIT] status before wait = {gripper.status()}", flush=True)
                     # Do NOT call open() here — open_gripper() resets the D6 joint
-                    # body1 reference inside the extension, which makes close_gripper()
-                    # silently no-op on every subsequent call.  The gripper is already
-                    # in Open state (close() was never called during the step loop).
-                    # Phase 1: arm settle — hold at wp.position, NO close() calls.
+                    # body1 reference inside the extension, making close_gripper()
+                    # silently no-op on every subsequent call.
+                    #
+                    # Phase 1 — arm settle: hold at wp.position, no close() calls.
                     # The PD controller needs ~30 steps to finish converging after
                     # the main loop ends.  Calling close() before the arm is truly
                     # stationary floods the extension with failed attachment attempts
                     # and puts it in a non-responsive Open state.
                     _settle_steps = min(30, self.gripper_wait_steps)
                     _grip_steps   = self.gripper_wait_steps - _settle_steps
-                    print(f"[GRIPPER-WAIT] Phase 1: settling {_settle_steps} steps "
-                          f"(arm converging, no close)...", flush=True)
+                    if self.verbose:
+                        print(f"[GRIPPER-WAIT] Phase 1: settling {_settle_steps} steps "
+                              f"(arm converging, no close)...", flush=True)
                     for _ in range(_settle_steps):
                         _gw_pos, _gw_rot = ik.compute_forward_kinematics(
                             self.EE_FRAME, robot.get_joint_positions()
@@ -609,50 +622,42 @@ class DataCollector:
                         )
                         world.step(render=True)
 
-                    # Phase 2: grip — sync_to_link6() must be called every step
-                    # so the kinematic body registers as "moved" to PhysX.
-                    # A frozen kinematic body is treated as static and the
-                    # surface gripper extension skips its raycast entirely.
-                    # With the 3 cm pick clearance in task.py the arm is now
-                    # above the cube and won't press it, so continuous sync
-                    # is safe again.
-                    # ── Raw PhysX raycast diagnostic ─────────────────────────
-                    # Bypass the surface gripper extension completely and ask
-                    # PhysX directly what (if anything) is below the cup tip.
-                    try:
-                        from omni.physx import get_physx_scene_query_interface as _gpsqi
-                        _rc_pos, _rc_rot = ik.compute_forward_kinematics(
-                            self.EE_FRAME, robot.get_joint_positions()
-                        )
-                        _rc_tcp = robot_world_pos + robot_R @ (
-                            _rc_pos + _rc_rot @ np.array([0.0, 0.0, 0.215])
-                        )
-                        _rc_dir = (robot_R @ _rc_rot) @ np.array([0.0, 0.0, 1.0])
-                        _rc_hit = _gpsqi().raycast_closest(
-                            carb.Float3(_rc_tcp[0], _rc_tcp[1], _rc_tcp[2]),
-                            carb.Float3(float(_rc_dir[0]), float(_rc_dir[1]), float(_rc_dir[2])),
-                            0.15,
-                        )
-                        print(f"[RAYCAST-DIAG] origin={_rc_tcp.round(4)}", flush=True)
-                        print(f"[RAYCAST-DIAG] dir={_rc_dir.round(4)}", flush=True)
-                        print(f"[RAYCAST-DIAG] hit={_rc_hit}", flush=True)
-                    except Exception as _e:
-                        print(f"[RAYCAST-DIAG] error: {_e}", flush=True)
-                        _rc_dir = None
-                    # ─────────────────────────────────────────────────────────
+                    # Phase 2 — grip: sync_to_link6() must be called every step so
+                    # PhysX registers the kinematic body as moved and runs the raycast.
+                    # A frozen kinematic body is treated as static and the extension
+                    # skips its raycast entirely.
+                    if self.verbose:
+                        try:
+                            from omni.physx import get_physx_scene_query_interface as _gpsqi
+                            _rc_pos, _rc_rot = ik.compute_forward_kinematics(
+                                self.EE_FRAME, robot.get_joint_positions()
+                            )
+                            _rc_tcp = robot_world_pos + robot_R @ (
+                                _rc_pos + _rc_rot @ np.array([0.0, 0.0, 0.215])
+                            )
+                            _rc_dir = (robot_R @ _rc_rot) @ np.array([0.0, 0.0, 1.0])
+                            _rc_hit = _gpsqi().raycast_closest(
+                                carb.Float3(_rc_tcp[0], _rc_tcp[1], _rc_tcp[2]),
+                                carb.Float3(float(_rc_dir[0]), float(_rc_dir[1]), float(_rc_dir[2])),
+                                0.15,
+                            )
+                            print(f"[RAYCAST-DIAG] origin={_rc_tcp.round(4)}", flush=True)
+                            print(f"[RAYCAST-DIAG] dir={_rc_dir.round(4)}", flush=True)
+                            print(f"[RAYCAST-DIAG] hit={_rc_hit}", flush=True)
+                        except Exception as _e:
+                            print(f"[RAYCAST-DIAG] error: {_e}", flush=True)
+                            _rc_dir = None
 
-                    # Print EEF approach direction (reuse FK result from raycast if available).
-                    if _rc_dir is not None:
-                        _sd_dir = _rc_dir
-                    else:
-                        _, _sd_rot = ik.compute_forward_kinematics(
-                            self.EE_FRAME, robot.get_joint_positions()
-                        )
-                        _sd_dir = (robot_R @ _sd_rot) @ np.array([0.0, 0.0, 1.0])
-                    print(f"[GRIPPER-WAIT] scan_dir at Phase 2 = {_sd_dir.round(4)}", flush=True)
-
-                    print(f"[GRIPPER-WAIT] Phase 2: gripping {_grip_steps} steps "
-                          f"(sync active, close active)...", flush=True)
+                        if _rc_dir is not None:
+                            _sd_dir = _rc_dir
+                        else:
+                            _, _sd_rot = ik.compute_forward_kinematics(
+                                self.EE_FRAME, robot.get_joint_positions()
+                            )
+                            _sd_dir = (robot_R @ _sd_rot) @ np.array([0.0, 0.0, 1.0])
+                        print(f"[GRIPPER-WAIT] scan_dir at Phase 2 = {_sd_dir.round(4)}", flush=True)
+                        print(f"[GRIPPER-WAIT] Phase 2: gripping {_grip_steps} steps "
+                              f"(sync active, close active)...", flush=True)
                     for _gw in range(_grip_steps):
                         _gw_pos, _gw_rot = ik.compute_forward_kinematics(
                             self.EE_FRAME, robot.get_joint_positions()
@@ -670,10 +675,11 @@ class DataCollector:
                         )
                         world.step(render=True)
                         _gw_status = gripper.status()
-                        if _gw % 30 == 0:
+                        if self.verbose and _gw % 30 == 0:
                             print(f"[GRIPPER-WAIT] step {_gw:3d}  status={_gw_status}", flush=True)
                         if _gw_status == "closed":
-                            print(f"[GRIPPER-WAIT] latched at step {_gw}", flush=True)
+                            if self.verbose:
+                                print(f"[GRIPPER-WAIT] latched at step {_gw}", flush=True)
                             break
 
                 if self.dry_run:
@@ -687,8 +693,6 @@ class DataCollector:
                     print(f"    ✓ arrived  TCP_tip=({_tip_world[0]:.3f}, "
                           f"{_tip_world[1]:.3f}, {_tip_world[2]:.3f}) m", flush=True)
                     if wp.gripper > 0.5 and not _gripper_scan_done:
-                        # SurfaceGripper creates its own attachment joint; D6Joint body1
-                        # is never modified.  Use the gripper status and grippedObjects attr.
                         if gripper.is_closed():
                             import omni.usd as _ousd
                             _gp   = _ousd.get_context().get_stage().GetPrimAtPath(
@@ -704,12 +708,9 @@ class DataCollector:
                             print(f"    gripper scan: status=open — nothing gripped", flush=True)
                         _gripper_scan_done = True
 
-            # Settle at home — PD controller needs extra frames to physically
-            # reach the commanded position after the last Lerp step.
-            # Zero joint velocities first: the large multi-joint swings during
-            # return-home leave residual velocity that can drive a wrist joint
-            # (e.g. J5) through an unexpected arc when the ArticulationAction
-            # switches from the ramp target to the absolute HOME_POS value.
+            # Zero joint velocities before homing to prevent large multi-joint swings
+            # from leaving residual velocity that drives a wrist joint through an
+            # unexpected arc when ArticulationAction switches to absolute HOME_POS.
             robot.get_articulation_controller().apply_action(
                 ArticulationAction(
                     joint_positions=self.HOME_POS,
@@ -745,12 +746,7 @@ class DataCollector:
     # ── pyramid helpers ────────────────────────────────────────────────────────
 
     def _rebuild_pyramid(self, stage, world, meta: dict, pyramid, obj_map: dict):
-        """Delete the existing pyramid prim (if any) and build a fresh one with
-        the sampled dimensions, then reload it into the running PhysX scene.
-
-        In Isaac Sim 5.1.0, force_load_physics_from_usd() recompiles only the
-        changed prim without requiring a full world.reset().
-        """
+        """Rebuild the pyramid USD prim with new dimensions and reload it into PhysX."""
         from isaacsim.core.prims import SingleRigidPrim
         from omni.physx import get_physx_interface
 
@@ -758,15 +754,12 @@ class DataCollector:
 
         is_first = pyramid is None
 
-        # Overwrite the prim's geometry and physics attributes in place.
-        # UsdGeom.Mesh.Define is idempotent — it returns the existing prim when
-        # it already exists, so we never need to delete it.
+        # Overwrite the prim's geometry in place — UsdGeom.Mesh.Define is idempotent.
         #
-        # IMPORTANT: neither stage.RemovePrim() nor world.scene.remove_object()
-        # can be called here.  Both ultimately close the PhysX tensor simulation
-        # view, which globally invalidates ALL subsequent velocity queries.  By
-        # keeping the prim alive and the old wrapper registered, the tensor view
-        # stays valid and we can reuse the same SingleRigidPrim on every episode.
+        # IMPORTANT: neither stage.RemovePrim() nor world.scene.remove_object() can
+        # be called here.  Both close the PhysX tensor simulation view, which globally
+        # invalidates ALL subsequent velocity queries.  Keeping the prim alive and the
+        # old wrapper registered preserves the tensor view across episodes.
         self._build_pyramid_usd(stage, self.PYRAMID_PRIM, L, W, H, mass=0.25)
 
         # Re-author robot-arm collision filter (AddTarget is idempotent).
@@ -777,7 +770,6 @@ class DataCollector:
             _fpairs.GetFilteredPairsRel().AddTarget(
                 _Sdf.Path(f"{self.ROBOT_PRIM}/{_lk}"))
 
-        # Tell PhysX to recompile the updated collision geometry.
         get_physx_interface().force_load_physics_from_usd()
         for _ in range(2):
             world.step(render=False)
@@ -790,8 +782,7 @@ class DataCollector:
             obj_map['pyramid'] = pyramid
 
         # Subsequent episodes: return the existing wrapper unchanged.  The prim
-        # was never deleted so the tensor view is still valid; the new geometry
-        # was compiled by force_load_physics_from_usd above.
+        # was never deleted so the tensor view is still valid.
         return pyramid
 
     def _randomise_pyramid_colour(self, stage):
@@ -808,21 +799,12 @@ class DataCollector:
     @staticmethod
     def _build_pyramid_usd(stage, prim_path: str,
                            L: float, W: float, H: float, mass: float):
-        """True apex pyramid: rectangular base L×W at Z=0, apex at (0,0,H).
+        """Build or overwrite a true apex pyramid mesh with convex-hull collision.
 
-        Local origin = base centre. set_world_pose([px,py,pz]) places the base
-        centre at [px,py,pz], so pz=surface_z puts the base on the pallet.
-
-        Face winding (right-hand rule → outward normals):
-          Base   0,3,2,1  →  normal -Z  (downward, resting on pallet)
-          Front  0,1,4    →  normal ∝ (0,−2H,W)   (−Y side)
-          Right  1,2,4    →  normal ∝ (+2H,0,L)   (+X side)
-          Back   2,3,4    →  normal ∝ (0,+2H,W)   (+Y side)
-          Left   3,0,4    →  normal ∝ (−2H,0,L)   (−X side)
-
-        Z-component of ±X face normal: L/√(4H²+L²)
-        Z-component of ±Y face normal: W/√(4H²+W²)
-        These match _pyramid_best_face() in task.py exactly.
+        Local origin = base centre; apex at (0, 0, H).  Face normals match the
+        formulas used in task.py _pyramid_best_face():
+          ±X faces: Z-component = L/√(4H²+L²)
+          ±Y faces: Z-component = W/√(4H²+W²)
         """
         from pxr import Gf, UsdGeom, UsdPhysics
 
@@ -857,7 +839,8 @@ class DataCollector:
         UsdPhysics.MeshCollisionAPI.Apply(prim).CreateApproximationAttr().Set("convexHull")
 
     @staticmethod
-    def _generate_lula(urdf_path: str, output_path: str, default_q=None):
+    def _generate_lula(urdf_path: str, output_path: str, default_q=None, verbose: bool = False):
+        """Write a LULA kinematics description for the URDF."""
         import xml.etree.ElementTree as ET
         root      = ET.parse(urdf_path).getroot()
         joints    = [j.get('name') for j in root.findall('joint')
@@ -875,22 +858,12 @@ class DataCollector:
             f"acceleration_limits: [{', '.join(['40.0']*n)}]\n"
             f"jerk_limits: [{', '.join(['500.0']*n)}]\n"
         )
-        print(f"[COLLECT] Generated LULA description → {output_path}")
+        if verbose:
+            print(f"[COLLECT] Generated LULA description → {output_path}")
 
     @staticmethod
     def _create_sort_platforms(stage):
-        """Create static collision slabs for the SortingTask target platforms.
-
-        Must be called BEFORE world.reset() so PhysX compiles them as static
-        (kinematic-less) colliders.  Platforms have no RigidBodyAPI — immovable,
-        zero mass, objects rest on top.  Collision with the robot arm is filtered
-        to avoid constraint stiffness interfering with IK-driven trajectories.
-
-        Shapes:
-          cube     — flat UsdGeom.Cube  (L × W × H from SORT_PLATFORM_DIMS)
-          cylinder — flat UsdGeom.Cylinder (radius = dims[0]/2, height = dims[2])
-          pyramid  — flat UsdGeom.Cube
-        """
+        """Create static collision platforms in the stage for SortingTask targets."""
         from pxr import UsdGeom, UsdPhysics, Gf, Sdf
 
         robot_links = ("base_link", "base",
@@ -967,6 +940,8 @@ def parse_args():
                     help="Steps to hold at pick and retry gripper close (default 60).")
     ap.add_argument("--task-type", choices=["random", "sorting"], default="random",
                     help="Task mode: 'random' (PickAndPlaceTask) or 'sorting' (SortingTask).")
+    ap.add_argument("--verbose", action="store_true",
+                    help="Print diagnostic logs (gripper, IK, raycast). Off by default.")
     return ap.parse_args()
 
 
@@ -992,6 +967,7 @@ def main():
         DataCollector(
             raw_dir    = args.output_dir,
             task       = task,
+            verbose    = args.verbose,
             n_episodes          = args.n_episodes,
             image_size          = args.image_size,
             seed                = args.seed,

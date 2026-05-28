@@ -1,16 +1,7 @@
-# =============================================================================
-# Name        : joint_service_client.py
-# Author      : Duncan Kikkert
-# Created     : 15/4/2026
-# Last Update : 15/4/2026
-# Version     : 1.0
-# Description : Subscribes to /joint_command and forwards joint positions to
-#               the Doosan MoveJoint ROS2 service. Joint positions are
-#               converted from radians (ROS2 convention) to degrees (Doosan).
+# joint_service_client.py — Forwards /joint_command to the Doosan MoveJoint service.
 #
-# Dependencies : rclpy, sensor_msgs, dsr_msgs2
-# Usage        : bash launch/launch_bridge.sh (or run standalone with ROS2 sourced)
-# =============================================================================
+# Subscribes to /joint_command (radians), converts to degrees, and calls
+# /dsr01/motion/move_joint via the dsr_msgs2 ROS2 service interface.
 
 import math
 import rclpy
@@ -37,7 +28,10 @@ DEFAULT_SYNC_TYPE  = 0      # SYNC
 # Node
 # -----------------------------------------------------------------------------
 class JointServiceClient(Node):
+    """ROS2 node that converts /joint_command messages to Doosan MoveJoint calls."""
+
     def __init__(self):
+        """Subscribe to /joint_command and wait for the MoveJoint service."""
         super().__init__('joint_service_client')
 
         self.callback_group = ReentrantCallbackGroup()
@@ -62,11 +56,11 @@ class JointServiceClient(Node):
         self.get_logger().info("Service ready.")
 
     def _joint_command_callback(self, msg):
+        """Convert radians to degrees and send a MoveJoint request."""
         if len(msg.position) < 6:
             self.get_logger().warn(f"Expected 6 joint positions, got {len(msg.position)} — skipping.")
             return
 
-        # Convert radians to degrees for the Doosan service
         pos_deg = [math.degrees(p) for p in msg.position[:6]]
 
         request = MoveJoint.Request()
@@ -84,7 +78,8 @@ class JointServiceClient(Node):
         future = self.client.call_async(request)
         future.add_done_callback(self._response_callback)
 
-    def _response_callback(self, future):
+    def _response_callback(self, future) -> None:
+        """Log the MoveJoint service response."""
         try:
             response = future.result()
             if response.success:
@@ -97,7 +92,7 @@ class JointServiceClient(Node):
 # -----------------------------------------------------------------------------
 # Main
 # -----------------------------------------------------------------------------
-def main():
+def main() -> None:
     rclpy.init()
     node = JointServiceClient()
     try:

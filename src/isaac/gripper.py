@@ -1,32 +1,10 @@
-"""SurfaceGripperController — wraps isaacsim.robot.surface_gripper for the SMC
-two-cup suction gripper mounted at /World/h2017/link_6/SMC_gripper.
+# gripper.py — SMC two-cup surface gripper controller for /World/h2017/link_6.
+#
+# Two-phase init: call create_prims(stage) before world.reset(), then
+# acquire_interface() after.  Call sync_to_link6() every physics step to
+# keep the kinematic body co-located with the arm.
 
-Initialisation must happen in two phases so that physics prims exist before
-world.reset() compiles the articulation:
-
-    # --- BEFORE world.reset() ---
-    enable_extension("isaacsim.robot.surface_gripper")
-    gripper = SurfaceGripperController()
-    gripper.create_prims(stage)
-
-    # --- AFTER world.reset() ---
-    gripper.acquire_interface()
-
-Architecture:
-
-    /World/SMCGripperBody        — kinematic rigid body (non-articulation).
-                                   Posed every physics step via sync_to_link6()
-                                   so it tracks link_6 without constraint jitter.
-    /World/SurfaceGripperJoints  — D6 attachment point joints.
-                                   body0 = SMCGripperBody
-                                   body1 = link_6  (extension swaps to cube at grip time)
-    /World/SurfaceGripper        — IsaacSurfaceGripper prim.
-    /World/SMCGripperBody/Marker_* — red sphere markers that track the gripper.
-
-Tune _CUP_TIPS (in SMCGripperBody / link_6 local frame) until the red viewport
-spheres sit at the tip of each suction cone.
-"""
-
+import numpy as np
 from pxr import Gf, Sdf, UsdGeom, UsdPhysics
 
 import isaacsim.robot.surface_gripper._surface_gripper as _sg
@@ -100,13 +78,13 @@ class SurfaceGripperController:
             print("[GRIPPER] Interface acquired — ready")
             self._diagnose()
 
-    def open(self):
+    def open(self) -> None:
         if self._interface:
             self._interface.open_gripper(_GRIPPER_PRIM_PATH)
             if self._verbose:
                 print(f"[GRIPPER] open() → status={self._interface.get_gripper_status(_GRIPPER_PRIM_PATH)}")
 
-    def close(self):
+    def close(self) -> None:
         if self._interface:
             self._interface.close_gripper(_GRIPPER_PRIM_PATH)
 
@@ -124,13 +102,8 @@ class SurfaceGripperController:
     def is_closed(self) -> bool:
         return self.status() == "closed"
 
-    def sync_to_link6(self, world_pos, world_quat_wxyz):
-        """Pose the kinematic assembly body to match link_6's world transform.
-
-        Call every physics step BEFORE world.step() so the surface-gripper scan
-        origin is current.  world_pos is a (3,) array; world_quat_wxyz is (4,)
-        in w-x-y-z order (Isaac Sim convention).
-        """
+    def sync_to_link6(self, world_pos: np.ndarray, world_quat_wxyz: np.ndarray) -> None:
+        """Pose the kinematic assembly body to match link_6 world transform each step."""
         if self._body_prim is not None:
             self._body_prim.set_world_pose(position=world_pos, orientation=world_quat_wxyz)
 
@@ -183,16 +156,7 @@ class SurfaceGripperController:
         prim.GetAttribute("physics:mass").Set(0.001)
 
     def _create_attachment_joints(self, stage) -> list:
-        """One D6 attachment point joint per suction cup tip.
-
-        Mirrors SurfaceGripper_gantry.usda exactly:
-          body0 = SMCGripperBody (gripper body)
-          body1 = link_6        (arm body — extension swaps this to the gripped object)
-          transX/Y: free (lateral alignment)
-          transZ:   [0, 0.01 m] with spring drive (suction compression)
-          rotX/Y/Z: ±3° with spring drives (angular compliance)
-        The scan goes in +Z of body0 (downward for H2017).
-        """
+        """One D6 attachment joint per cup tip, with stiff drives on all axes."""
         stage.DefinePrim(_JOINTS_SCOPE_PATH, "Scope")
         joint_paths = []
 
@@ -276,7 +240,8 @@ class SurfaceGripperController:
             UsdPhysics.CollisionAPI.Apply(prim)
             prim.GetAttribute("physics:collisionEnabled").Set(False)
 
-    def _create_surface_gripper_prim(self, stage, joint_paths: list):
+    def _create_surface_gripper_prim(self, stage, joint_paths: list) -> None:
+        """Register the SurfaceGripper USD prim and wire it to the D6 attachment joints."""
         robot_schema.CreateSurfaceGripper(stage, _GRIPPER_PRIM_PATH)
         prim = stage.GetPrimAtPath(_GRIPPER_PRIM_PATH)
 

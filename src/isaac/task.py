@@ -1,3 +1,4 @@
+# task.py — Scripted pick-and-place tasks with LULA IK waypoint generation.
 from dataclasses import dataclass
 from typing import Dict, List, Optional, Tuple
 
@@ -7,6 +8,7 @@ from scipy.spatial.transform import Rotation
 
 @dataclass
 class Waypoint:
+    """One pose in a scripted joint-space trajectory."""
     position: np.ndarray  # 6-element joint angles in radians
     gripper:  float       # 0.0 = open, 1.0 = closed
     n_steps:  int = 15
@@ -20,9 +22,7 @@ def _quat_eef_down() -> np.ndarray:
 
 
 def _quat_eef_down_yaw(yaw: float) -> np.ndarray:
-    """Gripper +Z pointing down, rotated yaw radians around world Z.
-    Used for pick-side IK so J6 aligns with the cube's yaw orientation.
-    yaw=0 gives the same result as _quat_eef_down()."""
+    """Straight-down EEF orientation rotated yaw radians around world Z."""
     xyzw = (Rotation.from_euler('z', yaw) * Rotation.from_euler('x', np.pi)).as_quat()
     return np.array([xyzw[3], xyzw[0], xyzw[1], xyzw[2]])
 
@@ -30,12 +30,8 @@ def _quat_eef_down_yaw(yaw: float) -> np.ndarray:
 def _quat_for_face_normal(n_outward: np.ndarray) -> np.ndarray:
     """wxyz quaternion aligning gripper +Z with the inward face normal (-n_outward).
 
-    Builds a full orthonormal body frame to eliminate the unconstrained axial
-    spin around the approach axis that the single-axis-align approach leaves free:
-      z_body = -n_outward          (cups press perpendicular into the surface)
-      x_body = world_ref × z_body  (horizon-locked; removes the free yaw DOF)
-      y_body = z_body × x_body     (completes the right-handed frame)
-    Falls back to world-forward as the reference when n_outward is near-vertical.
+    Builds a full orthonormal body frame to eliminate the unconstrained axial spin
+    around the approach axis. Falls back to world-forward when n_outward is near-vertical.
     """
     z_body = -n_outward / np.linalg.norm(n_outward)
 
@@ -96,19 +92,18 @@ PYRAMID_POOL = [
 # Minimum graspable width (m): 2/3 × perpendicular_dim must exceed this.
 # Slightly above the 4.4 cm cup span measured in gripper.py.
 PYRAMID_GRIPPER_FP = 0.05
-PYRAMID_APPROACH   = 0.03   # extra pre-contact clearance for slanted faces
-PYRAMID_GRIP_DWELL = 45     # dwell at contact before gripper fires (arm settled by then)
+PYRAMID_APPROACH   = 0.03   # m — extra pre-contact clearance for slanted faces
+PYRAMID_GRIP_DWELL = 45     # steps to dwell at contact before gripper fires
 
-# Pyramid approach needs more steps than cube because the EEF must swing from
-# home (J6≈0) to the tilted face-normal orientation (J6≈90°) — ~1.5°/step at
-# 60 steps is too fast for the PD controller and causes visible oscillation.
+# Pyramid needs more steps because the EEF must swing from home (J6≈0) to the
+# tilted face-normal orientation (J6≈90°) — ~1.5°/step at 60 steps causes PD overshoot.
 PYRAMID_SAFE_STEPS     = 150  # home → pallet_safe (large J2 + J6 swing)
 PYRAMID_APPROACH_STEPS = 75   # pallet_safe → pre_pick, pre_pick → contact
 PYRAMID_TRANSFER_STEPS = 120  # retract → transfer and transfer → pre_place (large multi-joint swings)
 
 # IK solving tolerances — kept in sync with DataCollector constants
-_IK_POS_TOL = 0.005
-_IK_ORI_TOL = 0.01
+_IK_POS_TOL = 0.005   # m
+_IK_ORI_TOL = 0.01    # rad
 
 # Home / rest pose (radians) — robot start position and final return waypoint.
 _JP_HOME = np.array([0.0, 0.0, 1.57, 0.0, 1.57, 0.0])
@@ -119,38 +114,31 @@ _APPROACH_STEPS = 60   # pre-pick → contact and retract
 _TRANSFER_STEPS = 90   # retract → transfer and transfer → pre-place
 _HOME_STEPS     = 120  # retract-from-place → home (J1 ~90°, J2 ~80° in one arc)
 
-# Minimum absolute J2 value permitted at either end of any interpolated arc.
-# J2 ≈ 0 rad means the upper arm is near-vertical; an arc that crosses from
-# positive J2 to negative J2 (or vice versa) sweeps the arm upward through the
-# [0,0,0,0,0,0] singularity region.
+# J2 ≈ 0 rad is near-vertical; arcs crossing this zone swing the arm through
+# the [0,0,0,0,0,0] singularity region with unpredictable joint velocities.
 _J2_SWING_THRESHOLD = np.radians(15.0)
 
 
 def _arc_crosses_vertical(a: float, b: float) -> bool:
-    """True when the shortest-arc interpolation from J2=a to J2=b crosses through the
-    near-vertical zone (-_J2_SWING_THRESHOLD, +_J2_SWING_THRESHOLD) in the interior.
+    """True when the J2 arc from a to b crosses the near-vertical zone in its interior.
 
-    An arc whose DESTINATION is near zero (e.g., returning to home where J2=0) is NOT
-    flagged — the arm is intentionally stopping at vertical, not swinging through it.
-    An arc whose SOURCE is near zero (e.g., starting from home) is likewise allowed.
+    Arcs that start or end near vertical (home, J2=0) are intentional and are not flagged.
     """
     diff  = (b - a + np.pi) % (2 * np.pi) - np.pi
     b_end = a + diff
-    if abs(b_end) < _J2_SWING_THRESHOLD:   # arm stops at/near vertical — intentional (home)
+    if abs(b_end) < _J2_SWING_THRESHOLD:   # destination is near vertical — intentional (home)
         return False
-    if abs(a) < _J2_SWING_THRESHOLD:       # arm starts at/near vertical — intentional (home)
+    if abs(a) < _J2_SWING_THRESHOLD:       # source is near vertical — intentional (home)
         return False
     return a * b_end < 0                   # sign change → arc crosses zero
 
 
-def _normalize_j6(waypoints: list) -> list:
+def _normalize_j6(waypoints: List[Waypoint]) -> List[Waypoint]:
     """Resolve each J6 to the ±π equivalent closest to the preceding waypoint.
 
-    The SMC two-cup suction gripper has 180° rotational symmetry, so J6 and
-    J6±π produce identical grasps. Anchoring each step to the previous rather
-    than independently to zero eliminates inter-waypoint 180° spins that arise
-    when two adjacent IK solutions land on opposite sides of the ±π boundary.
-    The first waypoint is anchored to 0 (home J6).
+    The SMC gripper has 180° rotational symmetry, so J6 and J6±π produce identical
+    grasps. Anchoring each step to the previous eliminates 180° spins that arise
+    when adjacent IK solutions land on opposite sides of the ±π boundary.
     """
     result = []
     prev_j6 = 0.0
@@ -165,9 +153,8 @@ def _normalize_j6(waypoints: list) -> list:
     return result
 
 
-def _trajectory_safe(waypoints) -> bool:
-    """Return False if any consecutive waypoint pair would sweep J2 through the
-    near-vertical zone, causing the arm to fling upward through [0,0,0,0,0,0]."""
+def _trajectory_safe(waypoints: List[Waypoint]) -> bool:
+    """Return False if any consecutive pair would sweep J2 through the near-vertical zone."""
     for i in range(len(waypoints) - 1):
         if _arc_crosses_vertical(waypoints[i].position[1],
                                  waypoints[i + 1].position[1]):
@@ -192,30 +179,7 @@ WAYPOINT_NAMES = [
 
 
 class PickAndPlaceTask:
-    """
-    Scripted pick-and-place with per-episode domain randomisation.
-
-    Object types and EEF strategy:
-      cube     — 10×10×10 cm, straight-down EEF.
-      cylinder — 10 cm dia × 8 cm, straight-down EEF.
-      pyramid  — one of 16 pre-baked apex pyramids (PYRAMID_POOL), selected
-                 randomly each episode.  EEF tilts to the outward normal of
-                 the most-horizontal graspable face.
-
-    sample(rng, ik, robot_world_pos, robot_R, ee_frame) returns:
-        waypoints, instruction, pick_pos, place_pos, obj_type, meta
-
-    All Cartesian targets are resolved to joint angles (6-element arrays, radians)
-    during sample() using the supplied LULA solver.  Returns waypoints=None when
-    IK fails for any target so collect.py can resample the episode cleanly.
-
-    pick_pos for cube/cylinder = geometric centre (DynamicCuboid/Cylinder convention).
-    pick_pos for pyramid       = base centre at surface_z (USD local origin).
-    meta = {} for cube/cylinder; {'pool_idx': int, 'L', 'W', 'H'} for pyramid.
-
-    Instructions always use generic nouns ("object"/"item") — the model must
-    learn the correct approach angle from the visual geometry.
-    """
+    """Scripted pick-and-place with per-episode domain randomisation for cube, cylinder, and pyramid objects."""
 
     OBJ_TYPES = list(_OBJ_PARAMS) + ['pyramid']
 
@@ -247,7 +211,9 @@ class PickAndPlaceTask:
         max_reach_xy:   float = 1.65,
         eef_z_offset:   float = 0.195,
         instructions:   Optional[List[str]] = None,
+        verbose:        bool  = False,
     ):
+        """Configure workspace bounds and EEF geometry for episode sampling."""
         self.pick_x       = pick_x
         self.pick_y       = pick_y
         self.surface_z    = surface_z
@@ -261,8 +227,10 @@ class PickAndPlaceTask:
         self.max_reach_xy = max_reach_xy
         self.eef_z_offset = eef_z_offset
         self.instructions = instructions or self.DEFAULT_INSTRUCTIONS
+        self.verbose      = verbose
 
     def _sample_xy(self, rng, x_range, y_range) -> np.ndarray:
+        """Sample a random XY position within the given ranges and the reachable annulus."""
         for _ in range(500):
             xy = np.array([rng.uniform(*x_range), rng.uniform(*y_range)])
             r = np.linalg.norm(xy)
@@ -272,14 +240,7 @@ class PickAndPlaceTask:
 
     @staticmethod
     def _pyramid_best_face(L: float, W: float, H: float):
-        """
-        Return (face_axis, n_outward_pos_side) for the most-horizontal face that
-        fits the gripper footprint, or None if neither face pair qualifies.
-
-        face_axis          ∈ {'x', 'y'}
-        n_outward_pos_side = unit outward normal of the positive-side face;
-                             caller flips sign for the −side.
-        """
+        """Return (face_axis, n_outward_pos_side) for the most-horizontal graspable face, or None."""
         candidates = []
 
         if 2.0 * W / 3.0 >= PYRAMID_GRIPPER_FP:   # ±X pair
@@ -300,14 +261,10 @@ class PickAndPlaceTask:
     def _solve_ik(self, ik, pos_world: np.ndarray, ori_wxyz: np.ndarray,
                   robot_world_pos: np.ndarray, robot_R: np.ndarray,
                   ee_frame: str, warm_start: np.ndarray = None):
-        """Resolve a world-space Cartesian target to joint angles. Returns (q, ok).
+        """Resolve a world-space Cartesian target to joint angles; returns (q, ok).
 
-        All returned joint angles are wrapped to [-π, π].  The generated LULA YAML
-        has no joint position limits, so LULA can return angles such as 256.9° for
-        a joint whose hardware range is ±180°.  Wrapping here prevents those values
-        from reaching the waypoint list and the Isaac Sim ArticulationAction, which
-        would attempt to drive the joint to a physically unreachable position.
-        _normalize_j6 runs after IK and handles the J6 ±π symmetry separately.
+        Output is wrapped to [-π, π] because the LULA YAML has no joint limits and
+        can return values like 256.9° that ArticulationAction would try to reach physically.
         """
         pos_robot = robot_R.T @ (pos_world - robot_world_pos)
         q, ok = ik.compute_inverse_kinematics(
@@ -331,14 +288,13 @@ class PickAndPlaceTask:
         robot_R:     np.ndarray,
         ee_frame:    str,
     ):
-        """Return (q_safe, q_p3, q_p4) for the pick approach whose pallet-safe
-        joint configuration is closest to home in joint space, by trying several
-        IK seeds.  LULA finds different local minima depending on the seed; for
-        tilted-face pyramids the default-q (home) seed produces large J4/J5
-        swings.  Trying seeds with J5 negated, J1 pre-rotated toward the pick
-        position, and combinations thereof often reveals a branch where the arm
-        stays much closer to its rest pose.  Returns None if no seed yields a
-        complete three-waypoint chain.
+        """Try multiple IK seeds and return the (q_safe, q_p3, q_p4) triple closest to home.
+
+        pick_l6 / pick_pre / pallet_safe are world-space link_6 targets; q_pick is the
+        wxyz EEF orientation quaternion for the pick face.
+        LULA finds different local minima from different seeds; for tilted-face pyramids the
+        default seed (home) often yields large J4/J5 swings. Returns None if no seed
+        yields a complete three-waypoint chain.
         """
         pick_robot = robot_R.T @ (pick_l6 - robot_world_pos)
         j1_est = float(np.arctan2(pick_robot[1], pick_robot[0]))
@@ -375,9 +331,10 @@ class PickAndPlaceTask:
 
         if best_triple is not None:
             qs, _, _ = best_triple
-            print(f"[TASK] pick branch: seed={best_seed_i}  "
-                  f"q_safe={np.degrees(qs).round(1).tolist()}  "
-                  f"dist_home={best_dist:.3f}", flush=True)
+            if self.verbose:
+                print(f"[TASK] pick branch: seed={best_seed_i}  "
+                      f"q_safe={np.degrees(qs).round(1).tolist()}  "
+                      f"dist_home={best_dist:.3f}", flush=True)
         return best_triple
 
     def sample(self, rng: np.random.Generator, ik,
@@ -385,7 +342,9 @@ class PickAndPlaceTask:
                ee_frame: str = 'link_6',
                force_obj_type: str = None,
                ik_place=None,
-               pick_yaw: float = 0.0):
+               pick_yaw: float = 0.0,
+               ) -> Tuple[Optional[List[Waypoint]], str, np.ndarray, np.ndarray, str, dict]:
+        """Sample one episode: returns (waypoints, instruction, pick_pos, place_pos, obj_type, meta)."""
         obj_type = force_obj_type if force_obj_type is not None \
                    else str(rng.choice(self.OBJ_TYPES))
         instruction = str(rng.choice(self.instructions))
@@ -418,7 +377,6 @@ class PickAndPlaceTask:
                         'face_axis': face_axis, 'side': side,
                         'n_outward': n_outward}
 
-        # cube / cylinder (or fallback)
         params    = _OBJ_PARAMS[obj_type]
         hh        = params['height'] / 2.0
         pick_pos  = np.array([*pick_xy,  self.surface_z + hh])
@@ -435,28 +393,28 @@ class PickAndPlaceTask:
                          ik, robot_world_pos: np.ndarray,
                          robot_R: np.ndarray, ee_frame: str,
                          ik_place=None, pick_yaw: float = 0.0) -> Optional[List[Waypoint]]:
-        """Straight-down EEF for cube / cylinder — 11-waypoint fully-chained sequence.
+        """Build an 11-waypoint trajectory for cube/cylinder with straight-down EEF.
 
         All waypoints are IK-solved with the previous solution as the warm-start seed
         so LULA stays in the same kinematic branch across the entire trajectory.
         Returns None if any IK solve fails so the episode can be resampled cleanly.
         """
-        q_pick = _quat_eef_down_yaw(pick_yaw)  # pick orientation rotated to match cube yaw
-        q_down = _quat_eef_down()               # straight down for place zone
+        q_pick = _quat_eef_down_yaw(pick_yaw)
+        q_down = _quat_eef_down()
         hh     = params['height'] / 2.0
         gd     = params['grip_dwell']
 
-        # 1 cm clearance keeps the cup tips above the object so the arm doesn't
-        # press the cube.  Surface grippers attach by scan — 8 cm range is plenty.
+        # 5 mm clearance keeps cup tips above the object so the arm doesn't press
+        # it down. Surface grippers attach by scan — 8 cm range is plenty.
         _PICK_Z_CLEARANCE = 0.005
-        co          = hh + self.eef_z_offset + _PICK_Z_CLEARANCE
+        co       = hh + self.eef_z_offset + _PICK_Z_CLEARANCE
         # All positions are link_6 targets in world space (NOT TCP).
         # TCP_tip = link_6 + R @ [0,0,0.215]; arm pointing down → TCP_Z = link_6_Z - 0.215.
         pick_l6     = np.array([pick[0],  pick[1],  pick[2]  + co])
         place_l6    = np.array([place[0], place[1], place[2] + co])
         pallet_safe = np.array([pick_l6[0],  pick_l6[1],  1.00])
         pre_pick    = pick_l6  + np.array([0.0, 0.0, 0.20])
-        transfer    = np.array([0.9, -0.5, 1.565])   # link_6 target; TCP ~0.215 m below
+        transfer    = np.array([0.9, -0.5, 1.565])   # fixed mid-air waypoint; TCP ~0.215 m below
         pre_place   = place_l6 + np.array([0.0, 0.0, 0.20])
 
         q_safe,     ok = self._solve_ik(ik, pallet_safe, q_pick, robot_world_pos, robot_R, ee_frame)
@@ -486,9 +444,8 @@ class PickAndPlaceTask:
             Waypoint(q_p6,       0.0, 60),               # retract from place
             Waypoint(_JP_HOME,   0.0, _HOME_STEPS),      # return home
         ]
-        # Normalize all waypoints except the final home waypoint.  Home always
-        # needs J6=0 exactly; including it in normalization can flip it to ±π,
-        # causing the wrist to lerp to 180° and then snap back during settle.
+        # Exclude the final home waypoint from J6 normalization — home needs J6=0
+        # exactly; normalizing it can flip it to ±π, causing a 180° wrist spin during settle.
         wps = _normalize_j6(wps[:-1]) + [wps[-1]]
         return wps if _trajectory_safe(wps) else None
 
@@ -505,13 +462,12 @@ class PickAndPlaceTask:
         ik_place=None,
         ik_pre_place=None,
     ) -> Optional[List[Waypoint]]:
-        """Pure joint-space 12-step sequence for pyramid pick-and-place.
+        """Build an 11-waypoint trajectory for pyramid pick-and-place with face-normal EEF.
 
-        Pick phase (p3/p4) approaches along the chosen face normal with a tilted
-        EEF so the suction cups press perpendicular into the sloped surface.
-        Place phase (p6/p7) maintains the same EEF orientation (q_pick) so the
-        gripped face is pressed flat against the conveyor belt.
-        All Cartesian targets are pre-solved to joint angles during episode setup.
+        Pick approaches along the chosen face normal (tilted EEF). Place maintains the same
+        EEF orientation so the gripped face is pressed flat against the belt.
+        ik_place seeds toward the belt zone; ik_pre_place overrides the pre_place solve only
+        (defaults to ik_place, or ik if ik_place is None).
         Returns None if any IK solve fails.
         """
         q_pick = _quat_for_face_normal(n_outward)
@@ -523,24 +479,20 @@ class PickAndPlaceTask:
         else:
             fc_off = np.array([0.0, side * W / 3.0, H / 3.0])
 
-        _PICK_CLEARANCE = 0.005                  # keep cup tips off face surface (same as cube)
+        _PICK_CLEARANCE = 0.005   # m — keep cup tips off face surface
         pick_fc  = pick_base + fc_off
         pick_l6  = pick_fc  + (ez + _PICK_CLEARANCE) * n_outward
-        pick_pre = pick_l6  + a  * n_outward   # pre-pick along face normal
+        pick_pre = pick_l6  + a  * n_outward
 
         # Raise the place target so the pyramid BASE lands at place_z, not the grip face.
         # The grip face centroid is H/3 above the base; without this lift the base would
         # collide with the conveyor before the arm reaches its target.
         place_base_lifted = place_base + np.array([0.0, 0.0, H / 3.0])
         place_l6    = place_base_lifted + ez * n_outward
-        pallet_safe = pick_l6   + 0.15 * n_outward              # clearance along face normal
-        transfer    = np.array([0.9, -0.5, 1.565])              # fixed mid-air waypoint, same as cube/cylinder
-        pre_place   = place_l6  + a  * n_outward               # approach belt along face normal
+        pallet_safe = pick_l6   + 0.15 * n_outward
+        transfer    = np.array([0.9, -0.5, 1.565])   # fixed mid-air waypoint, same as cube/cylinder
+        pre_place   = place_l6  + a  * n_outward     # approach belt along face normal
 
-        # Solve pick approach with multi-seed branch selection: try several IK seeds
-        # and keep the (q_safe, q_p3, q_p4) triple whose pallet-safe config is closest
-        # to home in joint space.  LULA finds different local minima from different seeds;
-        # the default seed (home) often yields large J4/J5 swings for tilted-face pyramids.
         _pick_branch = self._pick_ik_branch(
             ik, pick_l6, pick_pre, pallet_safe, q_pick,
             robot_world_pos, robot_R, ee_frame,
@@ -549,10 +501,9 @@ class PickAndPlaceTask:
             return None
         q_safe, q_p3, q_p4 = _pick_branch
 
-        # Normalize J6 for the approach sequence now, so all five pre-contact waypoints
-        # (safe, pre-pick, pick-contact, dwell, retract) share a consistent J6 branch.
-        # Dwell and retract reuse q_p4/q_p3 arrays; without early normalization the arm
-        # would spin 180° between pick-contact and dwell — right as the gripper fires.
+        # Normalize J6 for the pick approach now so all five pre-contact waypoints share
+        # a consistent J6 branch. Without early normalization the arm spins 180° between
+        # pick-contact and dwell — right as the gripper fires.
         _pre = _normalize_j6([
             Waypoint(q_safe, 0.0, 1),
             Waypoint(q_p3,   0.0, 1),
@@ -564,14 +515,17 @@ class PickAndPlaceTask:
         _ik_pp = ik_pre_place if ik_pre_place is not None else _ik_pl
         q_transfer, ok = self._solve_ik(_ik_pl, transfer, q_pick, robot_world_pos, robot_R, ee_frame)
         if not ok: return None
+
         # Snap transfer J6 to the ±π equivalent closest to normalized pick J6 before
-        # warm-starting place solves — the wrong J6 would propagate into J1-J5.
+        # warm-starting place solves — the wrong J6 propagates into J1-J5.
         q_transfer = q_transfer.copy()
         _alt = q_transfer[5] + (np.pi if q_transfer[5] < 0 else -np.pi)
         if abs(_alt - q_p4_n[5]) < abs(q_transfer[5] - q_p4_n[5]):
             q_transfer[5] = _alt
-        # Compute geometric seeds for the place phase.  The belt zone (y≈-1.28)
-        # needs J1 pointing toward the platform and J2 well below 90°.
+
+        # Geometric seeds for place phase: J1 estimated from arctan2 toward platform,
+        # J2/J3/J5 from observed belt-zone configs. Avoids near-singular J2≈90°
+        # that the default warm-start (J1=-29° from q_transfer) converges to.
         _pp_xyz = robot_R.T @ (pre_place - robot_world_pos)
         _j1_est = float(np.arctan2(_pp_xyz[1], _pp_xyz[0]))
         _j6     = q_p4_n[5]
@@ -583,9 +537,8 @@ class PickAndPlaceTask:
             np.array([_j1_est + 0.35, np.radians(66.), np.radians(66.), 0., np.radians(48.), _j6]),
         ]
         if _ik_pp is _ik_pl:
-            # Same solver: try q_transfer-based seed first (J6 continuity), then geo,
-            # then ik_place's own default_q (J1=-130°) which may find a different
-            # solution branch that avoids J2=90°.
+            # Same solver: try q_transfer-based seed first (J6 continuity), then geo seeds,
+            # then ik_place's default_q (J1=-130°) which may find a different branch.
             _place_seed    = q_transfer.copy()
             _place_seed[5] = q_p4_n[5]
             _pp_seeds = [_place_seed] + _geo_seeds + [None]
@@ -598,7 +551,6 @@ class PickAndPlaceTask:
             if ok:
                 break
         if not ok: return None
-        # Try to solve place_l6 from q_p6, with geo seed fallbacks if that fails.
         q_p7, ok = self._solve_ik(_ik_pp, place_l6, q_pick, robot_world_pos, robot_R, ee_frame,
                                    warm_start=q_p6)
         if not ok:
@@ -610,10 +562,8 @@ class PickAndPlaceTask:
         if not ok: return None
 
         # Snap place-side J6 to the same ±π branch as the pick J6.
-        # The IK for the belt zone (different arm config) can land on the π-opposite
-        # J6 solution; without this snap the gripper rotates ~180° around the
-        # approach axis between pick and place, which appears as a 180° rotation of
-        # the placed pyramid.
+        # Belt-zone IK can land on the π-opposite J6 solution, causing the gripped
+        # pyramid to appear to rotate 180° as it is set down.
         q_p6 = q_p6.copy()
         q_p7 = q_p7.copy()
         for _q in (q_p6, q_p7):
@@ -627,12 +577,12 @@ class PickAndPlaceTask:
             Waypoint(q_p4_n,     0.0, PYRAMID_APPROACH_STEPS),  # pick contact (open)
             Waypoint(q_p4_n,     1.0, PYRAMID_GRIP_DWELL),      # dwell (closed)
             Waypoint(q_p3_n,     1.0, PYRAMID_APPROACH_STEPS),  # retract with object
-            Waypoint(q_transfer, 1.0, PYRAMID_TRANSFER_STEPS),  # transfer (no blend: arm settles before pre-place)
+            Waypoint(q_transfer, 1.0, PYRAMID_TRANSFER_STEPS),  # transfer (arm settles before pre-place)
             Waypoint(q_p6,       1.0, PYRAMID_TRANSFER_STEPS),  # pre-place
-            Waypoint(q_p7,       1.0, 90),              # place contact (closed)
-            Waypoint(q_p7,       0.0, 45),              # place release (open)
-            Waypoint(q_p6,       0.0, 60),              # retract from place
-            Waypoint(_JP_HOME,   0.0, _HOME_STEPS),     # return home
+            Waypoint(q_p7,       1.0, 90),                      # place contact (closed)
+            Waypoint(q_p7,       0.0, 45),                      # place release (open)
+            Waypoint(q_p6,       0.0, 60),                      # retract from place
+            Waypoint(_JP_HOME,   0.0, _HOME_STEPS),             # return home
         ]
         wps = _normalize_j6(wps[:-1]) + [wps[-1]]
         return wps if _trajectory_safe(wps) else None
@@ -640,7 +590,7 @@ class PickAndPlaceTask:
 
 # ── Sorting task ───────────────────────────────────────────────────────────────
 
-# Platform centre positions [x, y, z] in world frame.  Slabs are 0.01 m thick;
+# Platform centre positions [x, y, z] in world frame. Slabs are 0.01 m thick;
 # the top surface (where objects rest) is at centre_z + 0.005 = 0.860 m.
 SORT_PLATFORM_CENTRES = {
     'cube':     np.array([-0.5, -1.28, 0.855]),
@@ -659,15 +609,7 @@ _SORT_SURFACE_Z = 0.860   # platform top surface = centre_z + half-thickness
 
 
 class SortingTask(PickAndPlaceTask):
-    """Pick-and-sort variant: each object type has a fixed designated platform.
-
-    The pick side is identical to PickAndPlaceTask (random position on the pallet).
-    The place side always targets the platform assigned to the sampled object type:
-        cube     → [0.312, -1.28]
-        cylinder → [0.725, -1.28]
-        pyramid  → [1.17,  -1.28]
-    All placements target z = 0.860 m (top surface of 0.01 m thick platform slabs).
-    """
+    """Pick-and-sort variant: each object type has a fixed designated platform on the belt."""
 
     SORT_INSTRUCTIONS = [
         "place the object on its designated platform on the belt",
@@ -683,6 +625,7 @@ class SortingTask(PickAndPlaceTask):
     ]
 
     def __init__(self, **kwargs):
+        """Override place_z to the platform surface and use sorting-specific instructions."""
         kwargs.setdefault('place_z', _SORT_SURFACE_Z)
         super().__init__(**kwargs)
         self.instructions = self.SORT_INSTRUCTIONS
@@ -692,13 +635,14 @@ class SortingTask(PickAndPlaceTask):
                ee_frame: str = 'link_6',
                force_obj_type: str = None,
                ik_place=None,
-               pick_yaw: float = 0.0):
+               pick_yaw: float = 0.0,
+               ) -> Tuple[Optional[List[Waypoint]], str, np.ndarray, np.ndarray, str, dict]:
+        """Sample one episode; place position is always the fixed platform for the sampled object type."""
         obj_type    = force_obj_type if force_obj_type is not None \
                       else str(rng.choice(self.OBJ_TYPES))
         instruction = str(rng.choice(self.instructions))
         pick_xy     = self._sample_xy(rng, self.pick_x, self.pick_y)
 
-        # Fixed place xy for this object type.
         place_xy = SORT_PLATFORM_CENTRES[
             obj_type if obj_type in SORT_PLATFORM_CENTRES else 'cube'
         ][:2].copy()
@@ -721,11 +665,9 @@ class SortingTask(PickAndPlaceTask):
                 pick_pos  = np.array([*pick_xy,  self.surface_z])
                 place_pos = np.array([*place_xy, self.place_z])
 
-                # Cheap XY reach check: the pyramid platform is at a fixed x that
-                # can be far from the robot.  The face normal shifts link_6 by
-                # eef_z_offset * n_outward in XY.  Reject face/side combos whose
-                # predicted place_l6 XY distance exceeds the robot's reach before
-                # spending IK calls — collect.py will resample with a new face/side.
+                # Cheap XY reach check: the face normal shifts link_6 by eef_z_offset
+                # in XY. Reject face/side combos whose predicted place_l6 XY distance
+                # exceeds the robot's reach before spending IK calls.
                 _l6_xy  = place_xy + self.eef_z_offset * n_outward[:2]
                 _l6_rxy = _l6_xy   - robot_world_pos[:2]
                 if np.linalg.norm(_l6_rxy) > self.max_reach_xy:
@@ -735,10 +677,8 @@ class SortingTask(PickAndPlaceTask):
                             'n_outward': n_outward}
 
                 # Use ik_place for both transfer and pre_place/place_l6.
-                # The previous failure of ik_place for pyramid came from a bad warm
-                # start (J1=-29° from q_transfer).  Geometric seeds (J1≈-47° biased
-                # toward the platform, J2=56-77°) avoid the near-singular J2≈90°
-                # configuration that ik converges to in the belt zone.
+                # Geometric seeds (J1≈ arctan2 toward platform, J2=56-77°) avoid the
+                # near-singular J2≈90° configuration that the default warm-start converges to.
                 waypoints = self._build_pyramid_waypoints(
                     pick_pos, place_pos, L, W, H, face_axis, side, n_outward,
                     ik, robot_world_pos, robot_R, ee_frame,
@@ -749,7 +689,6 @@ class SortingTask(PickAndPlaceTask):
                         'face_axis': face_axis, 'side': side,
                         'n_outward': n_outward}
 
-        # cube / cylinder (or pyramid fallback)
         params    = _OBJ_PARAMS[obj_type]
         hh        = params['height'] / 2.0
         pick_pos  = np.array([*pick_xy,  self.surface_z + hh])
@@ -759,4 +698,3 @@ class SortingTask(PickAndPlaceTask):
             ik_place=ik_place, pick_yaw=pick_yaw,
         )
         return waypoints, instruction, pick_pos, place_pos, obj_type, {}
-
