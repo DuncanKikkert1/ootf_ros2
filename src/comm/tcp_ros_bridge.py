@@ -1,20 +1,10 @@
-# =============================================================================
-# Name        : tcp_ros_bridge.py
-# Author      : Duncan Kikkert
-# Created     : 14/4/2026
-# Last Update : 14/4/2026
-# Version     : 1.0
-# Description : Combined TCP receiver and ROS2 publisher. Listens for TCP
-#               messages, validates and parses them, then publishes joint
-#               positions directly to /joint_command as a JointState message.
-#               Replaces the separate receiver.py and ros_publisher.py.
+# tcp_ros_bridge.py — TCP receiver that publishes joint positions to /joint_command.
 #
-# Message format : key_cmd;status;extra_num;gripper;x;y;z;aw;ap;ar
-# Example        : 250;254;0;0;1.57;0;1.57;1.57;-1.57;0
+# Listens on port 9002 for semicolon-separated messages, validates them,
+# and publishes joint positions as sensor_msgs/JointState.
 #
-# Dependencies : socket, re (built-in), rclpy, sensor_msgs
-# Usage        : bash launch/launch_bridge.sh
-# =============================================================================
+# Message format: key_cmd;status;extra_num;gripper;x;y;z;aw;ap;ar
+# Example:        250;254;0;0;1.57;0;1.57;1.57;-1.57;0
 
 import re
 import socket
@@ -31,12 +21,7 @@ ROS_TOPIC = '/joint_command'
 
 FIELD_NAMES = ['key_cmd', 'status', 'extra_num', 'gripper', 'x', 'y', 'z', 'aw', 'ap', 'ar']
 
-# -----------------------------------------------------------------------------
-# Validation pattern
-# Expects 10 semicolon-separated fields:
-#   Fields 1-3    : one or more digits (integer only)
-#   Fields 4-10   : optional sign (+ or -) followed by digits, optional decimal
-# -----------------------------------------------------------------------------
+# Fields 1-3: integer only.  Fields 4-10: optional sign + digits + optional decimal.
 PATTERN = re.compile(
     r'^\d+;'
     r'\d+;'
@@ -50,11 +35,9 @@ PATTERN = re.compile(
     r'[+\-]?\d+(\.\d+)?$'
 )
 
-# -----------------------------------------------------------------------------
-# parse_message()
-# Splits a validated message string into named fields and returns a dictionary.
-# -----------------------------------------------------------------------------
+
 def parse_message(message):
+    """Split a validated message string into a named-field dict."""
     fields = message.split(';')
     return {
         'key_cmd':   int(fields[0]),
@@ -69,16 +52,17 @@ def parse_message(message):
         'ar':        float(fields[9]),
     }
 
-# -----------------------------------------------------------------------------
-# ROS2 publisher node
-# -----------------------------------------------------------------------------
+
 class JointCommandPublisher(Node):
+    """ROS2 node that publishes parsed joint positions to /joint_command."""
+
     def __init__(self):
         super().__init__('tcp_ros_bridge')
         self.publisher_ = self.create_publisher(JointState, ROS_TOPIC, 10)
         self.get_logger().info(f"Publishing to {ROS_TOPIC}")
 
     def publish(self, parsed):
+        """Publish a JointState from a parsed message dict."""
         msg = JointState()
         msg.header.stamp = self.get_clock().now().to_msg()
         msg.name     = ['joint_1', 'joint_2', 'joint_3', 'joint_4', 'joint_5', 'joint_6']
@@ -86,10 +70,9 @@ class JointCommandPublisher(Node):
         self.publisher_.publish(msg)
         self.get_logger().info(f"Published: {msg.position}")
 
-# -----------------------------------------------------------------------------
-# Main
-# -----------------------------------------------------------------------------
+
 def main():
+    """Accept one TCP connection and relay validated messages to ROS2."""
     rclpy.init()
     node = JointCommandPublisher()
 

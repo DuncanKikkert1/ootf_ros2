@@ -139,6 +139,7 @@ def main():
             time_scale           = args.time_scale,
             gripper_wait_steps   = int(args.gripper_wait_sec * 60),
             show_colliders       = True,
+            verbose              = True,
         )
         if replay_rng_state is not None:
             collector.rng.bit_generator.state = replay_rng_state

@@ -1,13 +1,12 @@
 #!/usr/bin/env python3
 # =============================================================================
-# debug_policy.py — Diagnose a finetuned Octo checkpoint by comparing
-#                   predicted actions against ground-truth .npz episodes.
+# debug_policy.py — Diagnose a finetuned Octo checkpoint against ground-truth
+#                   .npz episodes.
 #
-# Output is saved to debug/policy_diagnosis/ with a name encoding the data
-# and checkpoint used, so different runs never overwrite each other:
-#   debug/policy_diagnosis/<raw_exp>__<ckpt_experiment>.png / .txt
-#   debug/policy_diagnosis/<raw_exp>__<ckpt_experiment>__step<N>.png / .txt
-#   debug/policy_diagnosis/<raw_exp>__pretrained.png / .txt
+# Output saved to debug/policy_diagnosis/ with names encoding data + checkpoint:
+#   <raw_exp>__<ckpt_experiment>.png / .txt
+#   <raw_exp>__<ckpt_experiment>__step<N>.png / .txt
+#   <raw_exp>__pretrained.png / .txt
 #
 # Usage:
 #   ./run.sh debug policy
@@ -34,9 +33,8 @@ from octo_policy import OctoPolicy
 DOF_LABELS = ["dx", "dy", "dz", "drx", "dry", "drz", "grip"]
 
 
-# ── discovery helpers ─────────────────────────────────────────────────────────
-
 def _latest_checkpoint() -> Path | None:
+    """Return the most recently modified local finetune experiment dir, or None."""
     candidates = [
         d for d in _DATA_ROOT.glob("*/checkpoint/octo_finetune/experiment_*")
         if d.is_dir() and any(c.name.isdigit() for c in d.iterdir() if c.is_dir())
@@ -45,6 +43,7 @@ def _latest_checkpoint() -> Path | None:
 
 
 def _latest_raw_dir() -> Path | None:
+    """Return the most recently modified data/*/raw directory, or None."""
     candidates = [d for d in _DATA_ROOT.glob("*/raw") if d.is_dir()]
     return max(candidates, key=lambda p: p.stat().st_mtime) if candidates else None
 
@@ -64,9 +63,8 @@ def _output_name(raw_dir: Path, model_path: str, step: int | None, pretrained: b
     return _DIAG_DIR / filename
 
 
-# ── data loading ──────────────────────────────────────────────────────────────
-
 def load_episodes(raw_dir: Path, n: int) -> list[dict]:
+    """Load up to n episodes from .npz files in raw_dir."""
     files = sorted(raw_dir.glob("*.npz"))[:n]
     if not files:
         sys.exit(f"[ERR] No .npz files found in {raw_dir}")
@@ -78,9 +76,8 @@ def load_episodes(raw_dir: Path, n: int) -> list[dict]:
     return episodes
 
 
-# ── inference ─────────────────────────────────────────────────────────────────
-
 def run_inference(policy: OctoPolicy, episodes: list[dict]) -> tuple[np.ndarray, np.ndarray]:
+    """Run the policy on all episodes and return (ground_truth, predictions) arrays."""
     all_gt, all_pred = [], []
     for ep_idx, ep in enumerate(episodes):
         images, gt_actions = ep["images"], ep["actions"]
@@ -93,9 +90,8 @@ def run_inference(policy: OctoPolicy, episodes: list[dict]) -> tuple[np.ndarray,
     return np.array(all_gt), np.array(all_pred)
 
 
-# ── diagnostics ───────────────────────────────────────────────────────────────
-
 def _build_stats_table(gt: np.ndarray, pred: np.ndarray) -> str:
+    """Format a per-DOF statistics table comparing gt and pred arrays."""
     lines = []
     lines.append("── Action statistics ────────────────────────────────────────────")
     header = f"{'DOF':<8}  {'GT mean':>9}  {'GT std':>9}  {'Pred mean':>10}  {'Pred std':>9}  {'MAE':>8}  {'Corr':>7}"
@@ -117,6 +113,7 @@ def _build_stats_table(gt: np.ndarray, pred: np.ndarray) -> str:
 
 
 def print_stats(gt: np.ndarray, pred: np.ndarray):
+    """Print the per-DOF statistics table to stdout."""
     print("\n" + _build_stats_table(gt, pred) + "\n")
 
 
@@ -129,6 +126,7 @@ def save_stats(
     n_episodes: int,
     n_steps: int,
 ):
+    """Write the statistics table and metadata to a .txt file alongside out_path."""
     import datetime
     lines = [
         "=" * 68,
@@ -150,6 +148,7 @@ def save_stats(
 
 
 def make_plot(gt: np.ndarray, pred: np.ndarray, out_path: Path, n_episodes: int, checkpoint_label: str):
+    """Save a 4-row diagnostic plot (time series, scatter, distributions, MAE/corr bars)."""
     try:
         import matplotlib
         matplotlib.use("Agg")
@@ -228,9 +227,8 @@ def make_plot(gt: np.ndarray, pred: np.ndarray, out_path: Path, n_episodes: int,
     plt.close(fig)
 
 
-# ── CLI ───────────────────────────────────────────────────────────────────────
-
 def parse_args():
+    """Parse CLI arguments for checkpoint, data directory, and evaluation settings."""
     ap = argparse.ArgumentParser(description="Visualize Octo policy predictions vs ground truth.")
     ap.add_argument("--checkpoint",   type=str, default=None,
                     help="Path to an octo_finetune experiment dir (default: latest)")
@@ -250,9 +248,9 @@ def parse_args():
 
 
 def main():
+    """Resolve checkpoint and data, run inference, and save plot + stats table."""
     args = parse_args()
 
-    # ── resolve checkpoint ────────────────────────────────────────────────
     if args.pretrained:
         model_path   = "hf://rail-berkeley/octo-small-1.5"
         dataset_name = "bridge_dataset"
@@ -270,7 +268,6 @@ def main():
         dataset_name = args.dataset_name
         ckpt_label   = model_path
 
-    # ── resolve raw data dir ──────────────────────────────────────────────
     if args.raw_dir:
         raw_dir = Path(args.raw_dir)
     else:
@@ -279,11 +276,9 @@ def main():
             sys.exit(f"[ERR] No raw episode directories found under {_DATA_ROOT}")
         print(f"[INFO] Using raw dir: {raw_dir}")
 
-    # ── build output path ─────────────────────────────────────────────────
     out_path = _output_name(raw_dir, model_path, args.step, args.pretrained)
     print(f"[INFO] Output → {out_path}")
 
-    # ── load policy ───────────────────────────────────────────────────────
     print(f"\n[INFO] Loading model …")
     policy = OctoPolicy(
         model_path   = model_path,
@@ -292,7 +287,6 @@ def main():
         step         = args.step,
     )
 
-    # ── check dataset statistics keys ─────────────────────────────────────
     stats = policy.model.dataset_statistics
     print(f"\n[INFO] dataset_statistics keys: {list(stats.keys())}")
     if dataset_name not in stats and "action" not in stats:
@@ -300,13 +294,11 @@ def main():
         print(f"       Actions will NOT be unnormalized — predictions may be wrong scale.")
         print(f"       Available keys: {list(stats.keys())}")
 
-    # ── load and run episodes ─────────────────────────────────────────────
     episodes = load_episodes(raw_dir, args.n_episodes)
     print(f"\n[INFO] Running inference on {len(episodes)} episodes …")
     gt, pred = run_inference(policy, episodes)
     print(f"\n[INFO] Total steps evaluated: {len(gt)}")
 
-    # ── report ────────────────────────────────────────────────────────────
     print_stats(gt, pred)
     save_stats(gt, pred, out_path, ckpt_label, raw_dir, len(episodes), len(gt))
     make_plot(gt, pred, out_path, len(episodes), ckpt_label)

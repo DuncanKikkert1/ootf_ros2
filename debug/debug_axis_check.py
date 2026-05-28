@@ -1,31 +1,18 @@
 #!/usr/bin/env python3
-# =============================================================================
-# Name        : axis_check.py
-# Author      : Duncan Kikkert
-# Created     : 24/4/2026
-# Description : Sends fixed single-axis EEF delta pulses to verify that
-#               Octo's output frame is aligned with the robot's EEF axes.
+# debug_axis_check.py — Verify Octo EEF delta axis alignment against the robot.
 #
-#               For each axis (dx, dy, dz, drx, dry, drz) the script sends
-#               a positive pulse, then a negative pulse, then pauses so you
-#               can observe the resulting motion in Isaac Sim (or on the real
-#               robot) before moving on.
+# Sends fixed single-axis pulses (+/-) so you can visually confirm that each
+# axis moves the EEF in the expected direction.
 #
-#               Expected bridge_dataset (Octo) conventions:
-#                 dx > 0  →  EEF moves forward  (away from robot base)
-#                 dy > 0  →  EEF moves left
-#                 dz > 0  →  EEF moves up
-#                 drx > 0 →  EEF rolls  counter-clockwise (viewed from +x)
-#                 dry > 0 →  EEF pitches up
-#                 drz > 0 →  EEF yaws   left
+# Expected bridge_dataset (Octo) conventions:
+#   dx > 0  → EEF moves forward   dy > 0 → EEF moves left
+#   dz > 0  → EEF moves up        drx > 0 → rolls CCW from +x
+#   dry > 0 → pitches up          drz > 0 → yaws left
 #
-# Usage (virtual / Isaac Sim):
-#   bash launch/launch.sh virtual          # terminal 1 — start the sim
-#   python octo_vla/axis_check.py --ros2-output   # terminal 2 — run check
-#
-# Usage (TCP / real robot or remote bridge):
-#   python octo_vla/axis_check.py --host 192.168.1.244 --port 9005
-# =============================================================================
+# Usage:
+#   bash launch/launch.sh virtual          # start sim (terminal 1)
+#   python debug/debug_axis_check.py --ros2-output   # run check (terminal 2)
+#   python debug/debug_axis_check.py --host 192.168.1.244 --port 9005
 
 import argparse
 import sys
@@ -61,6 +48,7 @@ AXES = [
 
 
 def parse_args():
+    """Parse CLI arguments for sender mode, axis selection, and pulse parameters."""
     ap = argparse.ArgumentParser(
         description="Verify Octo EEF delta axis alignment against the robot."
     )
@@ -86,6 +74,7 @@ def parse_args():
 
 
 def send_pulse(sender, delta, steps, step_delay, label):
+    """Send a fixed delta for the given number of steps."""
     vals = "  ".join(f"{v:+.4f}" for v in delta)
     print(f"    [{label}]  {vals}")
     for _ in range(steps):
@@ -94,6 +83,7 @@ def send_pulse(sender, delta, steps, step_delay, label):
 
 
 def run(sender, args):
+    """Send +/- pulses for each selected axis and prompt for visual confirmation."""
     # Rebuild AXES with CLI-overridden magnitudes
     axes = [
         ("dx",  [args.delta_t, 0, 0, 0, 0, 0, 0.5],
@@ -147,6 +137,7 @@ def run(sender, args):
 
 
 def main():
+    """Resolve the sender backend and run the axis check."""
     args = parse_args()
 
     if args.ros2_output:

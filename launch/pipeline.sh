@@ -114,6 +114,12 @@ if [[ "$PHASE" == "all" || "$PHASE" == "finetune" ]]; then
     TRAIN_PY=$(detect_train_python)
     if [ -z "$TRAIN_PY" ]; then echo "ERROR: No Python found for training."; exit 1; fi
 
+    # Expose cuDNN (installed via pip as nvidia-cudnn-cu12) so JAX can use the GPU.
+    _CUDNN_LIB=$("$TRAIN_PY" -c "import nvidia.cudnn, os; print(os.path.dirname(nvidia.cudnn.__file__))" 2>/dev/null)/lib
+    if [ -d "$_CUDNN_LIB" ]; then
+        export LD_LIBRARY_PATH="$_CUDNN_LIB${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}"
+    fi
+
     echo "=== Finetune ==="
     echo "  Python  : $TRAIN_PY"
     echo "  Raw dir : $RAW_DIR"

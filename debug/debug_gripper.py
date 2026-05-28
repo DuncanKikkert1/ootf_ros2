@@ -1,17 +1,12 @@
 #!/usr/bin/env python3
-"""test_gripper.py — Interactive gripper test.
-
-Sends the robot to a fixed joint configuration, closes the surface gripper,
-returns to home, opens the gripper, then resets the cube to its pick position
-so the test can be repeated without manual repositioning.
-
-Run WHILE sim_node.py is already running:
-    python3 debug/test_gripper.py
-  or:
-    ./run.sh debug gripper-test
-
-Joint angles are given in degrees and converted to radians automatically.
-"""
+# debug_gripper.py — Interactive gripper test (requires sim_node.py running).
+#
+# Sends the robot to a fixed joint configuration, closes the gripper,
+# returns home, opens the gripper, then resets the cube to its pick position.
+#
+# Usage:
+#   python3 debug/debug_gripper.py
+#   ./run.sh debug gripper-test
 
 import math
 import time
@@ -28,10 +23,10 @@ JOINT_DEG = [27.0, 84.0, 70.5, 0.0, 25.0, 34.5]
 
 JOINT_NAMES   = ['joint_1', 'joint_2', 'joint_3', 'joint_4', 'joint_5', 'joint_6']
 SETTLE_SEC    = 3.0    # seconds to wait for the robot to reach the target
-GRIP_WAIT_SEC = 3.0    # seconds to wait after closing the gripper (allow retries)
+GRIP_WAIT_SEC = 3.0    # seconds to hold after closing (allow gripper retries)
 RETURN_SEC    = 3.0    # seconds to wait while moving back to home
 RELEASE_SEC   = 1.0    # seconds after opening the gripper before reset
-POS_TOL_RAD   = 0.05   # radians — "close enough" threshold for each joint
+POS_TOL_RAD   = 0.05   # radians — "close enough" threshold per joint
 
 # Home position to return to after gripping (degrees)
 HOME_DEG = [0.0, 0.0, 90.0, 0.0, 90.0, 0.0]
@@ -43,7 +38,10 @@ HOME_RAD  = [math.radians(d) for d in HOME_DEG]
 
 
 class GripperTester(Node):
+    """ROS2 node that drives the robot through a pick-grip-return-release sequence."""
+
     def __init__(self):
+        """Subscribe to joint states and gripper status; advertise control topics."""
         super().__init__('gripper_tester')
         self._current_positions = None
         self._gripper_status    = "unknown"
@@ -67,9 +65,8 @@ class GripperTester(Node):
         self._gripper_status  = parts[0]   # 'open' | 'closing' | 'closed'
         self._gripped_objects = [o for o in parts[1].split(",") if o] if len(parts) > 1 else []
 
-    # ── helpers ──────────────────────────────────────────────────────────────
-
     def send_joints(self, positions_rad: list):
+        """Publish a JointState command."""
         msg = JointState()
         msg.header.stamp = self.get_clock().now().to_msg()
         msg.name     = JOINT_NAMES
@@ -87,6 +84,7 @@ class GripperTester(Node):
         self._reset_pub.publish(Empty())
 
     def wait_for_joint_state(self, timeout=5.0):
+        """Block until a /joint_states message arrives."""
         deadline = time.monotonic() + timeout
         while self._current_positions is None:
             rclpy.spin_once(self, timeout_sec=0.05)
@@ -94,6 +92,7 @@ class GripperTester(Node):
                 raise RuntimeError("No /joint_states received — is sim_node.py running?")
 
     def at_target(self) -> bool:
+        """Return True if all joints are within POS_TOL_RAD of JOINT_RAD."""
         if self._current_positions is None:
             return False
         return all(
@@ -102,13 +101,13 @@ class GripperTester(Node):
         )
 
     def spin_for(self, seconds: float):
+        """Process ROS2 callbacks for the given duration."""
         deadline = time.monotonic() + seconds
         while time.monotonic() < deadline:
             rclpy.spin_once(self, timeout_sec=0.05)
 
-    # ── main test sequence ────────────────────────────────────────────────────
-
     def run(self):
+        """Execute the full pick-grip-return-release test sequence."""
         print("\n── Gripper test ─────────────────────────────────────────────")
         print(f"Target joints (deg): {JOINT_DEG}")
         print(f"Target joints (rad): {[round(r, 4) for r in JOINT_RAD]}")
