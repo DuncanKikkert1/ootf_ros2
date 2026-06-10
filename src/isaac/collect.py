@@ -26,25 +26,29 @@ from task import (PickAndPlaceTask, SortingTask, Waypoint, _OBJ_PARAMS,
 # ─────────────────────────────────────────────────────────────────────────────
 
 class EpisodeBuffer:
-    """Per-episode accumulator of image/action/instruction frames."""
+    """Per-episode accumulator of image/action/proprio/instruction frames."""
 
     def __init__(self):
-        self._images:  list = []
-        self._actions: list = []
-        self._instr:   str  = ""
+        self._images:   list = []
+        self._actions:  list = []
+        self._proprios: list = []
+        self._instr:    str  = ""
 
-    def add_step(self, image: np.ndarray, action: np.ndarray, instruction: str):
+    def add_step(self, image: np.ndarray, action: np.ndarray,
+                 proprio: np.ndarray, instruction: str):
         """Append one simulation step."""
         self._images.append(image)
         self._actions.append(action.astype(np.float32))
+        self._proprios.append(proprio.astype(np.float32))
         self._instr = instruction
 
     def save(self, path: Path, rng_state: dict = None):
         """Write frames to a compressed .npz file."""
         np.savez_compressed(
             path,
-            images      = np.stack(self._images,  axis=0),
-            actions     = np.stack(self._actions, axis=0),
+            images      = np.stack(self._images,   axis=0),
+            actions     = np.stack(self._actions,  axis=0),
+            proprios    = np.stack(self._proprios, axis=0),
             instruction = self._instr,
             rng_state   = np.array([rng_state], dtype=object) if rng_state is not None else np.array([]),
         )
@@ -64,6 +68,12 @@ class DataCollector:
     EE_FRAME       = "link_6"
     WRIST_CAM_PRIM = "/World/h2017/link_6/MechEye/MechEye/Camera"
 
+    # NOTE: CUBE_PRIM is a DynamicCuboid created at runtime, not the
+    # /World/Pickables/Cube that exists in sim2.usd.  sim_node.py resets
+    # /World/Pickables/Cube during live rollouts, so the visual object at
+    # inference differs from the one trained on.  To fix, either create
+    # /World/pick_cube in the live scene, or refactor collection to use
+    # /World/Pickables/Cube directly (see sim_node.py comment for options).
     CUBE_PRIM     = "/World/pick_cube"
     CYLINDER_PRIM = "/World/pick_cylinder"
     PYRAMID_PRIM  = "/World/pick_pyramid"
@@ -83,16 +93,19 @@ class DataCollector:
         task:       PickAndPlaceTask,
         n_episodes: int,
         image_size: int = 128,
-        seed:       int = 42,
+        seed:       int = None,
         scene_usd:  str = None,
         urdf_path:  str = None,
         lula_desc:  str = None,
-        dry_run:             bool = False,
-        forced_obj_sequence: list = None,
-        time_scale:          int  = 1,
-        gripper_wait_steps:  int  = 60,
-        show_colliders:      bool = False,
-        verbose:             bool = False,
+        dry_run:             bool  = False,
+        forced_obj_sequence: list  = None,
+        time_scale:          int   = 1,
+        gripper_wait_steps:  int   = 60,
+        show_colliders:      bool  = False,
+        verbose:             bool  = False,
+        action_stride:       int   = 1,
+        fixed_yaw:           float = None,
+        no_domain_rand:      bool  = False,
     ):
         """Configure paths, episode count, and randomisation settings."""
         root = Path(__file__).parent.parent.parent
@@ -103,6 +116,7 @@ class DataCollector:
         self.n_episodes          = n_episodes
         self.image_size          = image_size
         self.rng                 = np.random.default_rng(seed)
+        _actual_seed             = int(self.rng.integers(0, 2**32)) if seed is None else seed
         self.scene_usd           = scene_usd or str(root / "scenes/usd/sim2.usd")
         self.urdf_path           = urdf_path or str(root / "scenes/h2017/urdf/h2017.urdf")
         self.lula_desc           = lula_desc or str(root / "scenes/h2017/urdf/h2017_lula.yaml")
@@ -111,11 +125,14 @@ class DataCollector:
         self.time_scale          = time_scale
         self.gripper_wait_steps  = gripper_wait_steps
         self.show_colliders      = show_colliders
+        self.action_stride       = max(1, int(action_stride))
+        self.fixed_yaw           = fixed_yaw
+        self.no_domain_rand      = no_domain_rand
         self.raw_dir.mkdir(parents=True, exist_ok=True)
         import json as _json, datetime as _dt
         _meta_path = self.raw_dir.parent / "run_meta.json"
         if not _meta_path.exists():
-            _json.dump({"seed": seed, "started": _dt.datetime.utcnow().isoformat()},
+            _json.dump({"seed": _actual_seed, "started": _dt.datetime.utcnow().isoformat()},
                        _meta_path.open("w"), indent=2)
 
     # ── run ───────────────────────────────────────────────────────────────────
@@ -303,19 +320,21 @@ class DataCollector:
         # ── Replicator (cube + cylinder; pyramid colour set manually) ─────────
         if self.verbose:
             print("[COLLECT] Replicator setup ...", flush=True)
-        with rep.trigger.on_frame():
-            with rep.get.light():
-                rep.modify.attribute("inputs:intensity",
-                                     rep.distribution.uniform(300, 4000))
-                rep.modify.attribute("inputs:colorTemperature",
-                                     rep.distribution.uniform(3200, 7500))
-            for pp in (self.CUBE_PRIM, self.CYLINDER_PRIM):
-                with rep.get.prims(path_pattern=pp):
-                    rep.randomizer.color(
-                        colors=rep.distribution.uniform((0,0,0), (1,1,1))
-                    )
+        if not self.no_domain_rand:
+            with rep.trigger.on_frame():
+                with rep.get.light():
+                    rep.modify.attribute("inputs:intensity",
+                                         rep.distribution.uniform(300, 4000))
+                    rep.modify.attribute("inputs:colorTemperature",
+                                         rep.distribution.uniform(3200, 7500))
+                for pp in (self.CUBE_PRIM, self.CYLINDER_PRIM):
+                    with rep.get.prims(path_pattern=pp):
+                        rep.randomizer.color(
+                            colors=rep.distribution.uniform((0,0,0), (1,1,1))
+                        )
         if self.verbose:
-            print("[COLLECT] Replicator ready", flush=True)
+            _dr = "disabled (no-domain-rand)" if self.no_domain_rand else "ready"
+            print(f"[COLLECT] Replicator {_dr}", flush=True)
 
         # obj_map is updated dynamically when a pyramid episode is encountered.
         obj_map: dict = {'cube': cube, 'cylinder': cylinder}
@@ -335,7 +354,9 @@ class DataCollector:
             )
             # Sample yaw before task.sample() so the IK can align J6 to it.
             # Pyramid ignores pick_yaw (it uses face-normal orientation instead).
-            _ep_yaw = float(self.rng.uniform(0, 2 * np.pi))
+            # Use fixed_yaw=0.0 for overfit runs to remove rotational variation.
+            _ep_yaw = (self.fixed_yaw if self.fixed_yaw is not None
+                       else float(self.rng.uniform(0, 2 * np.pi)))
             waypoints, instruction, pick_pos, _, obj_type, meta = \
                 self.task.sample(self.rng, ik, robot_world_pos, robot_R, self.EE_FRAME,
                                  force_obj_type=force_type, ik_place=ik_place,
@@ -411,12 +432,16 @@ class DataCollector:
                 world.step(render=False)
 
             # Pyramid colour must be set manually — Replicator doesn't track
-            # dynamically recreated prims.
-            if obj_type == 'pyramid':
+            # dynamically recreated prims.  Skip in no-domain-rand mode so
+            # colour stays fixed across all episodes.
+            if obj_type == 'pyramid' and not self.no_domain_rand:
                 self._randomise_pyramid_colour(stage)
 
             # ── Replicator step: lighting + cube/cylinder colours ──────────
-            rep.orchestrator.step(rt_subframes=4, pause_timeline=False)
+            # Skipped in no-domain-rand mode; scene lighting and object colours
+            # remain identical across all episodes.
+            if not self.no_domain_rand:
+                rep.orchestrator.step(rt_subframes=4, pause_timeline=False)
 
             if self.dry_run:
                 _obj = obj_map.get(obj_type)
@@ -438,6 +463,8 @@ class DataCollector:
 
             buf = EpisodeBuffer()
             prev_pos = prev_rot = prev_rgb = None
+            prev_gripper = 0.0   # gripper state at start of current stride window
+            _stride_count = 0    # steps since last saved observation
 
             n_wps = len(waypoints)
             _gripper_scan_done = False
@@ -566,15 +593,33 @@ class DataCollector:
                     )
                     if prev_pos is None:
                         prev_pos, prev_rot, prev_rgb = cur_pos, cur_rot.copy(), cur_rgb
+                        prev_gripper = wp.gripper
+                        _stride_count = 0
                         continue
 
-                    d_pos   = cur_pos - prev_pos
-                    d_euler = Rotation.from_matrix(cur_rot @ prev_rot.T).as_euler('xyz')
-                    action  = np.concatenate([d_pos, d_euler, [wp.gripper]])
+                    _stride_count += 1
+                    if _stride_count >= self.action_stride:
+                        # Non-overlapping stride: observation from action_stride frames
+                        # ago → action = displacement over that window.  This matches
+                        # live inference where one policy call spans action_stride frames.
+                        d_pos   = cur_pos - prev_pos
+                        d_euler = Rotation.from_matrix(cur_rot @ prev_rot.T).as_euler('xyz')
+                        # Gripper: use state at end of the stride window
+                        action  = np.concatenate([d_pos, d_euler, [wp.gripper]])
 
-                    if prev_rgb is not None:
-                        buf.add_step(prev_rgb, action.astype(np.float32), instruction)
-                    prev_pos, prev_rot, prev_rgb = cur_pos, cur_rot.copy(), cur_rgb
+                        if prev_rgb is not None:
+                            # 7D proprio: EEF xyz + roll/pitch/yaw + gripper state
+                            # Orientation and gripper let the model distinguish
+                            # "approaching" from "holding" and predict rotations correctly.
+                            prev_euler  = Rotation.from_matrix(prev_rot).as_euler('xyz')
+                            proprio_7d  = np.concatenate(
+                                [prev_pos, prev_euler, [prev_gripper]]
+                            ).astype(np.float32)
+                            buf.add_step(prev_rgb, action.astype(np.float32),
+                                         proprio_7d, instruction)
+                        prev_pos, prev_rot, prev_rgb = cur_pos, cur_rot.copy(), cur_rgb
+                        prev_gripper = wp.gripper
+                        _stride_count = 0
 
                 # After the arm arrives at the pick dwell, hold position and retry
                 # gripper.close() for gripper_wait_steps steps before retract.
@@ -925,7 +970,7 @@ def parse_args():
     ap.add_argument("--output-dir",   required=True)
     ap.add_argument("--n-episodes",   type=int,   default=200)
     ap.add_argument("--image-size",   type=int,   default=128)
-    ap.add_argument("--seed",         type=int,   default=42)
+    ap.add_argument("--seed",         type=int,   default=None)
     ap.add_argument("--scene-usd",    default=None)
     ap.add_argument("--pick-x",       type=float, nargs=2, default=[0.59, 1.26])
     ap.add_argument("--pick-y",       type=float, nargs=2, default=[-0.3, 0.8])
@@ -940,6 +985,23 @@ def parse_args():
                     help="Steps to hold at pick and retry gripper close (default 60).")
     ap.add_argument("--task-type", choices=["random", "sorting"], default="random",
                     help="Task mode: 'random' (PickAndPlaceTask) or 'sorting' (SortingTask).")
+    ap.add_argument("--forced-obj-sequence", type=str, nargs="+", default=None,
+                    metavar="OBJ",
+                    help="Force object type(s) across episodes, cycling through the list "
+                         "(e.g. --forced-obj-sequence cube  or  cube cylinder pyramid).")
+    ap.add_argument("--action-stride", type=int, default=1,
+                    help="Save one action per N physics frames (default 1 = 60 Hz). "
+                         "Use 12 for 5 Hz inference (STEP_DELAY=0.2 s at 60 Hz physics).")
+    ap.add_argument("--fixed-yaw",       type=float, default=None, metavar="RAD",
+                    help="Fix all episode pick-yaw to this value in radians instead of "
+                         "sampling randomly. Use 0.0 for overfit/debug runs.")
+    ap.add_argument("--no-domain-rand", action="store_true",
+                    help="Disable all domain randomization: fixed lighting, fixed object "
+                         "colours, no Replicator steps. Use for overfit/debug runs where "
+                         "every episode must look identical.")
+    ap.add_argument("--instruction",    type=str, default=None,
+                    help="Fix the language instruction for every episode instead of "
+                         "sampling randomly from the default pool. Use for overfit runs.")
     ap.add_argument("--verbose", action="store_true",
                     help="Print diagnostic logs (gripper, IK, raycast). Off by default.")
     return ap.parse_args()
@@ -963,16 +1025,22 @@ def main():
             max_reach_xy = args.max_reach_xy,
             eef_z_offset = args.eef_z_offset,
         )
+        if args.instruction:
+            task_kwargs["instructions"] = [args.instruction]
         task = SortingTask(**task_kwargs) if args.task_type == "sorting" else PickAndPlaceTask(**task_kwargs)
         DataCollector(
             raw_dir    = args.output_dir,
             task       = task,
             verbose    = args.verbose,
-            n_episodes          = args.n_episodes,
-            image_size          = args.image_size,
-            seed                = args.seed,
-            scene_usd           = args.scene_usd,
-            gripper_wait_steps  = args.gripper_wait_steps,
+            n_episodes           = args.n_episodes,
+            image_size           = args.image_size,
+            seed                 = args.seed,
+            scene_usd            = args.scene_usd,
+            gripper_wait_steps   = args.gripper_wait_steps,
+            action_stride        = args.action_stride,
+            fixed_yaw            = args.fixed_yaw,
+            forced_obj_sequence  = args.forced_obj_sequence,
+            no_domain_rand       = args.no_domain_rand,
         ).run()
     except Exception:
         print("\n[COLLECT] ── FATAL ERROR ──────────────────────────", flush=True)

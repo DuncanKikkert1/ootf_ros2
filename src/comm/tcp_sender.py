@@ -9,6 +9,8 @@
 
 import socket
 
+import numpy as np
+
 
 class ROS2EEFPublisher:
     """Publishes 7-DOF EEF delta actions to a ROS2 Float64MultiArray topic."""
@@ -41,6 +43,48 @@ class ROS2EEFPublisher:
             self._node.destroy_node()
             self._node = None
             print("[ROS2] EEF publisher node destroyed.")
+
+    def __enter__(self):
+        self.connect()
+        return self
+
+    def __exit__(self, *_):
+        self.close()
+
+
+class ROS2EEFStateSubscriber:
+    """Subscribes to /eef_state and returns the latest EEF xyz position (robot local frame)."""
+
+    def __init__(self, topic: str = "/eef_state"):
+        self.topic   = topic
+        self._node   = None
+        self._latest = None
+
+    def connect(self):
+        """Initialise ROS2 and subscribe to the EEF state topic."""
+        import rclpy
+        from std_msgs.msg import Float64MultiArray
+        if not rclpy.ok():
+            rclpy.init()
+        self._node = rclpy.create_node("octo_eef_state_sub")
+        self._node.create_subscription(Float64MultiArray, self.topic, self._callback, 10)
+        print(f"[ROS2] Subscribed to EEF state: {self.topic}")
+
+    def _callback(self, msg) -> None:
+        self._latest = np.array(msg.data[:7], dtype=np.float32)
+
+    def get_latest(self) -> "np.ndarray | None":
+        """Spin once to drain pending messages and return the latest EEF xyz, or None."""
+        import rclpy
+        rclpy.spin_once(self._node, timeout_sec=0.05)
+        return self._latest
+
+    def close(self):
+        """Destroy the subscriber node."""
+        if self._node is not None:
+            self._node.destroy_node()
+            self._node = None
+            print("[ROS2] EEF state subscriber node destroyed.")
 
     def __enter__(self):
         self.connect()

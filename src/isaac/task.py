@@ -109,10 +109,16 @@ _IK_ORI_TOL = 0.01    # rad
 _JP_HOME = np.array([0.0, 0.0, 1.57, 0.0, 1.57, 0.0])
 
 # Shared step counts for cube/cylinder (straight-down EEF, smaller J6 swing than pyramid).
-_SAFE_STEPS     = 90   # home → pallet_safe (J2 swings ~90° from upright)
-_APPROACH_STEPS = 60   # pre-pick → contact and retract
-_TRANSFER_STEPS = 90   # retract → transfer and transfer → pre-place
-_HOME_STEPS     = 120  # retract-from-place → home (J1 ~90°, J2 ~80° in one arc)
+_SAFE_STEPS      = 90   # home → center_align (J2 swings ~90° from upright)
+_CENTERING_STEPS = 90   # center_align → pallet_safe (mostly vertical descent)
+_APPROACH_STEPS  = 60   # pre-pick → contact and retract
+_TRANSFER_STEPS  = 90   # retract → transfer and transfer → pre-place
+_HOME_STEPS      = 120  # retract-from-place → home (J1 ~90°, J2 ~80° in one arc)
+
+# World-frame link_6 Z for the centering waypoint.  The arm swings from HOME to
+# directly above the pick object at this height, so the wrist camera sees the object
+# move toward the frame centre.  Descent to pallet_safe (z=1.00) follows vertically.
+_CENTERING_Z = 1.50
 
 # J2 ≈ 0 rad is near-vertical; arcs crossing this zone swing the arm through
 # the [0,0,0,0,0,0] singularity region with unpredictable joint velocities.
@@ -162,9 +168,10 @@ def _trajectory_safe(waypoints: List[Waypoint]) -> bool:
     return True
 
 
-# Semantic labels for the 10-waypoint trajectory — used by debug tooling.
+# Semantic labels for the 12-waypoint trajectory — used by debug tooling.
 WAYPOINT_NAMES = [
-    "Pallet Safe",
+    "Center Above Pick",    # arm moves XY to directly above object at high Z
+    "Pallet Safe",          # vertical descent to clearance height above pick
     "Pre-Pick",
     "Pick Contact (open)",
     "Pick Dwell (closed)",
@@ -209,7 +216,7 @@ class PickAndPlaceTask:
         min_separation: float = 0.10,
         min_reach_xy:   float = 0.65,
         max_reach_xy:   float = 1.65,
-        eef_z_offset:   float = 0.195,
+        eef_z_offset:   float = 0.215,
         instructions:   Optional[List[str]] = None,
         verbose:        bool  = False,
     ):
@@ -417,7 +424,12 @@ class PickAndPlaceTask:
         transfer    = np.array([0.9, -0.5, 1.565])   # fixed mid-air waypoint; TCP ~0.215 m below
         pre_place   = place_l6 + np.array([0.0, 0.0, 0.20])
 
-        q_safe,     ok = self._solve_ik(ik, pallet_safe, q_pick, robot_world_pos, robot_R, ee_frame)
+        # Centering waypoint: directly above pick at high Z so the arm moves XY first.
+        # The wrist camera sees the object approach the frame centre during this arc.
+        center_align = np.array([pick_l6[0], pick_l6[1], _CENTERING_Z])
+        q_center,   ok = self._solve_ik(ik, center_align, q_pick, robot_world_pos, robot_R, ee_frame)
+        if not ok: return None
+        q_safe,     ok = self._solve_ik(ik, pallet_safe, q_pick, robot_world_pos, robot_R, ee_frame, warm_start=q_center)
         if not ok: return None
         q_p3,       ok = self._solve_ik(ik, pre_pick,    q_pick, robot_world_pos, robot_R, ee_frame, warm_start=q_safe)
         if not ok: return None
@@ -432,7 +444,8 @@ class PickAndPlaceTask:
         if not ok: return None
 
         wps = [
-            Waypoint(q_safe,     0.0, _SAFE_STEPS),      # pallet safe – clearance above pick
+            Waypoint(q_center,   0.0, _SAFE_STEPS),      # center above pick – XY alignment from home
+            Waypoint(q_safe,     0.0, _CENTERING_STEPS), # pallet safe – vertical descent to clearance
             Waypoint(q_p3,       0.0, _APPROACH_STEPS),  # pre-pick
             Waypoint(q_p4,       0.0, _APPROACH_STEPS),  # pick contact (open)
             Waypoint(q_p4,       1.0, gd),               # pick dwell   (closed)
@@ -482,16 +495,16 @@ class PickAndPlaceTask:
         _PICK_CLEARANCE = 0.005   # m — keep cup tips off face surface
         pick_fc  = pick_base + fc_off
         pick_l6  = pick_fc  + (ez + _PICK_CLEARANCE) * n_outward
-        pick_pre = pick_l6  + a  * n_outward
+        pick_pre = pick_l6  + np.array([0.0, 0.0, a])  # vertical final approach
 
-        # Raise the place target so the pyramid BASE lands at place_z, not the grip face.
-        # The grip face centroid is H/3 above the base; without this lift the base would
-        # collide with the conveyor before the arm reaches its target.
-        place_base_lifted = place_base + np.array([0.0, 0.0, H / 3.0])
+        # Offset the place target by fc_off so the pyramid BASE lands centered at place_base.
+        # The grip face centroid is at fc_off relative to the base (horizontal + vertical).
+        # Without the horizontal component the base lands shifted off-center by side*L/3 or side*W/3.
+        place_base_lifted = place_base + fc_off
         place_l6    = place_base_lifted + ez * n_outward
         pallet_safe = pick_l6   + 0.15 * n_outward
         transfer    = np.array([0.9, -0.5, 1.565])   # fixed mid-air waypoint, same as cube/cylinder
-        pre_place   = place_l6  + a  * n_outward     # approach belt along face normal
+        pre_place   = place_l6  + np.array([0.0, 0.0, a])  # vertical final approach to place
 
         _pick_branch = self._pick_ik_branch(
             ik, pick_l6, pick_pre, pallet_safe, q_pick,
@@ -510,6 +523,14 @@ class PickAndPlaceTask:
             Waypoint(q_p4,   0.0, 1),
         ])
         q_safe_n, q_p3_n, q_p4_n = _pre[0].position, _pre[1].position, _pre[2].position
+
+        # Centering waypoint: directly above pick base at high Z with straight-down
+        # EEF orientation.  The face-normal tilt is only needed from pallet_safe
+        # onwards; using it here at high Z makes IK unreliable.
+        center_align = np.array([pick_base[0], pick_base[1], _CENTERING_Z])
+        q_center, ok = self._solve_ik(ik, center_align, _quat_eef_down(),
+                                      robot_world_pos, robot_R, ee_frame)
+        if not ok: return None
 
         _ik_pl = ik_place if ik_place is not None else ik
         _ik_pp = ik_pre_place if ik_pre_place is not None else _ik_pl
@@ -572,7 +593,8 @@ class PickAndPlaceTask:
                 _q[5] = _alt
 
         wps = [
-            Waypoint(q_safe_n,   0.0, PYRAMID_SAFE_STEPS),      # pallet safe – clearance above pick
+            Waypoint(q_center,   0.0, PYRAMID_SAFE_STEPS),      # center above pick – XY alignment from home
+            Waypoint(q_safe_n,   0.0, _CENTERING_STEPS),        # pallet safe – vertical descent to clearance
             Waypoint(q_p3_n,     0.0, PYRAMID_APPROACH_STEPS),  # pre-pick (tilted)
             Waypoint(q_p4_n,     0.0, PYRAMID_APPROACH_STEPS),  # pick contact (open)
             Waypoint(q_p4_n,     1.0, PYRAMID_GRIP_DWELL),      # dwell (closed)

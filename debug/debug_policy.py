@@ -71,8 +71,19 @@ def load_episodes(raw_dir: Path, n: int) -> list[dict]:
     episodes = []
     for f in files:
         d    = np.load(f, allow_pickle=True)
-        lang = str(d["language_instruction"]) if "language_instruction" in d.files else "pick up the object"
-        episodes.append({"images": d["images"], "actions": d["actions"], "instruction": lang})
+        if "instruction" in d.files:
+            lang = str(d["instruction"])
+        elif "language_instruction" in d.files:
+            lang = str(d["language_instruction"])
+        else:
+            lang = "pick up the object"
+        proprios = d["proprios"] if "proprios" in d.files else None
+        episodes.append({
+            "images":      d["images"],
+            "actions":     d["actions"],
+            "proprios":    proprios,
+            "instruction": lang,
+        })
     return episodes
 
 
@@ -80,11 +91,12 @@ def run_inference(policy: OctoPolicy, episodes: list[dict]) -> tuple[np.ndarray,
     """Run the policy on all episodes and return (ground_truth, predictions) arrays."""
     all_gt, all_pred = [], []
     for ep_idx, ep in enumerate(episodes):
-        images, gt_actions = ep["images"], ep["actions"]
+        images, gt_actions, proprios = ep["images"], ep["actions"], ep["proprios"]
         policy.set_task_text(ep["instruction"])
         policy.reset()
         for t in range(len(images)):
-            all_pred.append(policy.step(images[t]))
+            proprio = proprios[t] if proprios is not None else None
+            all_pred.append(policy.step(images[t], proprio=proprio)[0])  # first action in chunk → (7,)
             all_gt.append(gt_actions[t])
         print(f"  episode {ep_idx+1}/{len(episodes)} done ({len(images)} steps)")
     return np.array(all_gt), np.array(all_pred)
@@ -242,8 +254,8 @@ def parse_args():
                     help="Directory with .npz episodes (default: most recently modified data/*/raw)")
     ap.add_argument("--n-episodes",   type=int, default=5,
                     help="Number of episodes to evaluate (default: 5)")
-    ap.add_argument("--window-size",  type=int, default=1,
-                    help="Observation history length passed to Octo (default: 1)")
+    ap.add_argument("--window-size",  type=int, default=2,
+                    help="Observation history length passed to Octo (default: 2)")
     return ap.parse_args()
 
 

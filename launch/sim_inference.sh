@@ -14,6 +14,14 @@
 
 PROJECT_ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 
+# ── Logging ──────────────────────────────────────────────────────────────────
+LOG_DIR="$PROJECT_ROOT/debug/logs/run/sim"
+mkdir -p "$LOG_DIR"
+LOG_FILE="$LOG_DIR/$(date +%Y%m%d_%H%M%S).log"
+export PYTHONUNBUFFERED=1
+exec > >(stdbuf -oL tee -a "$LOG_FILE") 2>&1
+echo "Logging to $LOG_FILE"
+
 # ── Detect ROS distro ────────────────────────────────────────────────────────
 if [ -z "$ROS_DISTRO" ]; then
     ROS_DISTRO=$(ls /opt/ros/ 2>/dev/null | head -1)
@@ -53,7 +61,7 @@ source "$ISAAC_WS/build_ws/$ROS_DISTRO/isaac_sim_ros_ws/install/local_setup.bash
 export ROS_DISTRO
 export RMW_IMPLEMENTATION=rmw_fastrtps_cpp
 export LD_LIBRARY_PATH="$ISAAC_BRIDGE/lib:$LD_LIBRARY_PATH"
-export PYTHONPATH="$ISAAC_BRIDGE/rclpy:$PYTHONPATH"
+export PYTHONPATH="$ISAAC_BRIDGE/rclpy:$PROJECT_ROOT/src/comm:$PYTHONPATH"
 
 echo "Using ROS_DISTRO : $ROS_DISTRO"
 echo "Using Isaac Sim  : $ISAAC_PY"
@@ -89,10 +97,19 @@ echo "Isaac Sim ready. Starting Octo VLA..."
 
 # XLA_PYTHON_CLIENT_PREALLOCATE=false: JAX allocates on demand instead of
 # grabbing a fixed pool (~75% of VRAM) at startup, leaving room for the RTX renderer.
+# --step-delay must match the action stride used during collection:
+#   collection --action-stride 12  →  inference --step-delay 0.2  (5 Hz, default)
+#   collection --action-stride  1  →  inference --step-delay 0.0167 (60 Hz)
+# Add --no-temporal-ensemble to see raw model output during debugging.
 XLA_PYTHON_CLIENT_PREALLOCATE=false "$OCTO_PY" "$PROJECT_ROOT/src/vla/run_octo_live.py" \
     --ros2-camera \
     --ros2-topic /mecheye/color \
     --ros2-output \
+    --window-size 2 \
+    --step-delay 0.2 \
+    --action-horizon 4 \
+    --no-temporal-ensemble \
+    --grip-hold-steps 20 \
     "$@" &
 PID_OCTO=$!
 

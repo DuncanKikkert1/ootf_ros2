@@ -52,6 +52,7 @@ class OctoFinetuner:
         finetune_mode:   str  = "head_mlp_only",
         n_steps:         int  = 50_000,
         batch_size:      int  = 32,
+        overfit:         bool = False,
         octo_dir:        Path = None,
     ):
         self.tfds_dir        = Path(tfds_dir)
@@ -60,6 +61,7 @@ class OctoFinetuner:
         self.finetune_mode   = finetune_mode
         self.n_steps         = n_steps
         self.batch_size      = batch_size
+        self.overfit         = overfit
         self.octo_dir        = Path(octo_dir) if octo_dir else self.DEFAULT_OCTO_DIR
 
     def run(self) -> None:
@@ -77,20 +79,31 @@ class OctoFinetuner:
             "TFDS_MODULES_IMPORT": "training.tfds_builder",
             "PYTHONPATH": f"{src_dir}{os.pathsep}{os.environ.get('PYTHONPATH', '')}",
             "WANDB_MODE": "disabled",
+            "OOTF_OVERFIT": "1" if self.overfit else "0",
         }
-        config = Path(__file__).parent / "finetune_config.py"
+        config      = Path(__file__).parent / "finetune_config.py"
+        config_str  = f"{self.finetune_mode},text_conditioned"
+        if self.overfit:
+            config_str += ",overfit"
         cmd = [
             sys.executable, str(script),
-            f"--config={config}:{self.finetune_mode},text_conditioned",
+            f"--config={config}:{config_str}",
             f"--config.pretrained_path={self.pretrained_path}",
             f"--config.dataset_kwargs.data_dir={self.tfds_dir}",
             f"--config.num_steps={self.n_steps}",
+            f"--config.optimizer.learning_rate.decay_steps={self.n_steps}",
+            f"--config.save_interval={self.n_steps // 10}",
+            f"--config.eval_interval={self.n_steps // 10}",
             f"--config.batch_size={self.batch_size}",
             f"--config.save_dir={self.checkpoint_dir}",
-            "--config.eval_interval=999999999",
+            # Octo's viz metrics (_gripping_early_metrics) are hardcoded for
+            # Bridge's 7-DOF proprio shape and crash with our (window_size, 3) proprio.
+            # Disable viz metrics only; validation loss from val_kwargs still runs.
             "--config.viz_kwargs.trajs_for_metrics=0",
+            "--config.viz_kwargs.trajs_for_viz=0",
         ]
-        print(f"[FINETUNE] mode={self.finetune_mode}  steps={self.n_steps}")
+        tag = "  OVERFIT" if self.overfit else ""
+        print(f"[FINETUNE] mode={self.finetune_mode}  steps={self.n_steps}{tag}")
         subprocess.run(cmd, env=env, check=True)
         print(f"\n[FINETUNE] Done — checkpoint at {self.checkpoint_dir}")
 
@@ -112,6 +125,10 @@ def parse_args() -> Namespace:
                     choices=["full", "head_only", "head_mlp_only"])
     ap.add_argument("--n-finetune-steps", type=int, default=50_000)
     ap.add_argument("--batch-size",       type=int, default=32)
+    ap.add_argument("--overfit",          action="store_true",
+                    help="Enable overfit mode: no augmentation, batch=8, warmup=50, "
+                         "weight_decay=0, eval/save every 250 steps. "
+                         "Use with --n-finetune-steps 1000 for end-to-end debugging.")
     phase = ap.add_mutually_exclusive_group()
     phase.add_argument("--convert-only",  action="store_true")
     phase.add_argument("--finetune-only", action="store_true")
@@ -130,21 +147,34 @@ def main() -> None:
     if not args.convert_only:
         # Octo's 95/5 train/val split requires at least 20 episodes — the 5%
         # slice resolves to 0 records below that, crashing validation setup.
-        n_episodes = len(list(Path(args.raw_dir).glob("*.npz")))
-        if n_episodes < 20:
-            print(
-                f"[FINETUNE] Skipping: only {n_episodes} episode(s) in {args.raw_dir}.\n"
-                f"           Octo's 95/5 train/val split requires at least 20 episodes.\n"
-                f"           Re-run with --n-episodes 200 (or at least 20) to finetune."
-            )
-        else:
-            OctoFinetuner(
+        # Skip this check when --finetune-only: TFDS was already built from
+        # a valid episode count, and raw episodes may have been cleaned up.
+        if not args.finetune_only:
+            n_episodes = len(list(Path(args.raw_dir).glob("*.npz")))
+            if n_episodes < 20:
+                print(
+                    f"[FINETUNE] Skipping: only {n_episodes} episode(s) in {args.raw_dir}.\n"
+                    f"           Octo's 95/5 train/val split requires at least 20 episodes.\n"
+                    f"           Re-run with --n-episodes 200 (or at least 20) to finetune."
+                )
+                return
+        # Reduce default batch_size for memory-intensive modes.
+        batch = args.batch_size
+        if args.overfit and batch == 32:
+            batch = 8
+        elif args.finetune_mode == "full" and batch == 32:
+            # Full finetuning backprops through all 300M params; batch=32 OOMs on RTX A5000
+            # (16 attention blocks × ~486MB JVP buffers ≈ 20GB). Auto-reduce to 8.
+            batch = 8
+            print("[FINETUNE] Full mode: auto-reducing batch_size 32→8 to fit GPU memory.")
+        OctoFinetuner(
                 tfds_dir        = tfds_dir,
                 checkpoint_dir  = ckpt_dir,
                 pretrained_path = args.pretrained_path,
                 finetune_mode   = args.finetune_mode,
                 n_steps         = args.n_finetune_steps,
-                batch_size      = args.batch_size,
+                batch_size      = batch,
+                overfit         = args.overfit,
             ).run()
 
 

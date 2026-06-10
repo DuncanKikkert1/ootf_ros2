@@ -14,6 +14,7 @@
 import argparse
 import sys
 import time
+from collections import deque
 from pathlib import Path
 
 import cv2
@@ -73,8 +74,8 @@ class USBCamera:
     def __exit__(self, *_):
         self.close()
 
-from octo_policy import OctoPolicy
-from tcp_sender  import EEFDeltaSender, ROS2EEFPublisher
+from octo_policy import OctoPolicy, LinearHeadPolicy
+from tcp_sender  import EEFDeltaSender, ROS2EEFPublisher, ROS2EEFStateSubscriber
 
 # ------------------------------------------------------------------
 # Defaults  (override via CLI)
@@ -109,8 +110,8 @@ def parse_args():
                          f"{DATASET_NAME} for pretrained)")
     ap.add_argument("--step",         type=int, default=None,
                     help="Checkpoint step to load (default: latest)")
-    ap.add_argument("--window-size",  type=int, default=1,
-                    help="Observation history length passed to Octo (default: 1)")
+    ap.add_argument("--window-size",  type=int, default=2,
+                    help="Observation history length passed to Octo (default: 2, must match training window_size)")
 
     task_grp = ap.add_mutually_exclusive_group()
     task_grp.add_argument("--instruction", type=str, default=None,
@@ -140,6 +141,24 @@ def parse_args():
                     help="Open an OpenCV window showing the live camera feed")
     ap.add_argument("--dry-run",    action="store_true",
                     help="Run without a camera (sends random noise images for testing Octo + TCP)")
+    ap.add_argument("--action-horizon", type=int, default=4,
+                    help="Number of actions per predicted chunk — must match training config (default: 4)")
+    ap.add_argument("--ensemble-weight", type=float, default=0.0,
+                    help="Exponential decay weight for temporal ensembling. "
+                         "0 = uniform average across overlapping predictions (default: 0)")
+    ap.add_argument("--no-temporal-ensemble", action="store_true",
+                    help="Use only chunk[0] without averaging overlapping predictions. "
+                         "Use this for debugging to see raw model output.")
+    ap.add_argument("--grip-threshold", type=float, default=0.9,
+                    help="Ensemble grip value must exceed this before closing the gripper. "
+                         "Higher values prevent premature closes during approach (default: 0.9)")
+    ap.add_argument("--grip-hold-steps", type=int, default=3,
+                    help="Once the gripper closes, hold it closed for at least this many "
+                         "steps regardless of model output. Gives the surface gripper time "
+                         "to latch before the model commands open (default: 10 = 2 s at 5 Hz)")
+    ap.add_argument("--head-path", type=str, default=None,
+                    help="Path to a trained linear_head.npz — uses LinearHeadPolicy "
+                         "instead of the diffusion head (recommended)")
 
     return ap.parse_args()
 
@@ -149,25 +168,38 @@ def main():
     args = parse_args()
 
     if args.model_path is None:
-        local_ckpt = _find_latest_checkpoint()
-        if local_ckpt:
-            args.model_path = str(local_ckpt)
-            print(f"[INFO] Using finetuned checkpoint: {local_ckpt}")
+        if args.head_path:
+            # Linear head mode: backbone is baked into the .npz.
+            # Skip local checkpoint auto-detection — loading a finetuned checkpoint
+            # here would produce different embeddings than the head was trained on.
+            args.model_path = MODEL_PATH   # LinearHeadPolicy will override from npz
         else:
-            args.model_path = MODEL_PATH
-            print(f"[INFO] No local checkpoint found — using pretrained: {MODEL_PATH}")
+            local_ckpt = _find_latest_checkpoint()
+            if local_ckpt:
+                args.model_path = str(local_ckpt)
+                print(f"[INFO] Using finetuned checkpoint: {local_ckpt}")
+            else:
+                args.model_path = MODEL_PATH
+                print(f"[INFO] No local checkpoint found — using pretrained: {MODEL_PATH}")
 
     if args.dataset_name is None:
         args.dataset_name = (
             "ootf_synthetic" if not args.model_path.startswith("hf://") else DATASET_NAME
         )
 
-    policy = OctoPolicy(
-        model_path   = args.model_path,
-        dataset_name = args.dataset_name,
-        window_size  = args.window_size,
-        step         = args.step,
-    )
+    if args.head_path:
+        policy = LinearHeadPolicy(
+            model_path  = args.model_path,
+            head_path   = args.head_path,
+            window_size = args.window_size,
+        )
+    else:
+        policy = OctoPolicy(
+            model_path   = args.model_path,
+            dataset_name = args.dataset_name,
+            window_size  = args.window_size,
+            step         = args.step,
+        )
 
     if args.goal_image:
         goal_bgr = cv2.imread(args.goal_image)
@@ -219,6 +251,11 @@ def main():
         camera = MechEyeCamera(args.camera_ip, args.camera_port)
         camera.connect()
 
+    eef_state_sub = None
+    if args.ros2_camera:
+        eef_state_sub = ROS2EEFStateSubscriber()
+        eef_state_sub.connect()
+
     sender_ctx = ROS2EEFPublisher() if args.ros2_output else EEFDeltaSender(args.host, args.port)
     with sender_ctx as sender:
         print(f"\n[INFO] Running. Ctrl+C to stop.")
@@ -227,8 +264,17 @@ def main():
         else:
             print(f"[INFO] Sending to {args.host}:{args.port}  step_delay={args.step_delay}s\n")
 
+        if eef_state_sub is not None:
+            print("[INFO] Waiting for first EEF state message...")
+            while eef_state_sub.get_latest() is None:
+                time.sleep(0.05)
+            print("[INFO] EEF state received.")
+
         policy.reset()
-        step = 0
+        act_history        = deque(maxlen=args.action_horizon)
+        step               = 0
+        grip_hold_remaining = 0
+        prev_grip           = 0.0
 
         if args.show_camera:
             cv2.namedWindow("Octo — camera feed", cv2.WINDOW_NORMAL)
@@ -253,23 +299,59 @@ def main():
                         print("[INFO] 'q' pressed — stopping.")
                         break
 
-                action = policy.step(frame_rgb)
+                proprio = eef_state_sub.get_latest() if eef_state_sub is not None else None
+                chunk = policy.step(frame_rgb, proprio=proprio)   # (action_horizon, 7)
 
+                if args.no_temporal_ensemble:
+                    # Use only the first action in the chunk — each action represents
+                    # one full action_stride window (0.2 s at stride=12).  Executing
+                    # the full chunk at sub-stride intervals causes 4× overshoot.
+                    action = chunk[0].copy()
+                else:
+                    # Temporal ensembling: blend this chunk with the last action_horizon
+                    # predictions.  Each overlapping prediction contributes its action for
+                    # the current timestep, weighted by exp(-ensemble_weight * age).
+                    act_history.append(chunk[: args.action_horizon])
+                    num_preds = len(act_history)
+                    curr_act_preds = np.stack([
+                        pred_actions[i]
+                        for i, pred_actions in zip(range(num_preds - 1, -1, -1), act_history)
+                    ])
+                    weights = np.exp(-args.ensemble_weight * np.arange(num_preds))
+                    weights = weights / weights.sum()
+                    action = np.sum(weights[:, None] * curr_act_preds, axis=0)
+                    # Never ensemble the gripper — future-chunk grip predictions bleed
+                    # into the current step 4 steps early, causing the gripper to fire
+                    # before the arm reaches the cube.  Use the raw current prediction.
+                    action[6] = chunk[0][6]
+
+                # Clamp gripper to binary: close only when ensemble is confident.
+                raw_grip = 1.0 if action[6] > args.grip_threshold else 0.0
+
+                # Hold timer: keep gripper closed for grip_hold_steps after first close.
+                if raw_grip > 0.5 and prev_grip < 0.5:
+                    grip_hold_remaining = args.grip_hold_steps
+
+                if grip_hold_remaining > 0:
+                    action[6] = 1.0
+                    grip_hold_remaining -= 1
+                else:
+                    action[6] = raw_grip
+
+                prev_grip = action[6]
                 sender.send(action)
 
                 step += 1
                 labels = ["dx", "dy", "dz", "drx", "dry", "drz", "grip"]
                 vals   = "  ".join(f"{l}={v:+.4f}" for l, v in zip(labels, action))
-                print(f"[STEP {step:04d}]  {vals}")
+                hold_tag = f"  [hold {grip_hold_remaining}]" if grip_hold_remaining > 0 else ""
+                print(f"[STEP {step:04d}]  {vals}{hold_tag}")
 
                 if args.steps > 0 and step >= args.steps:
                     print(f"[INFO] Reached {args.steps} steps. Done.")
                     break
 
-                elapsed = time.time() - t0
-                wait    = args.step_delay - elapsed
-                if wait > 0:
-                    time.sleep(wait)
+                time.sleep(args.step_delay)
 
         except KeyboardInterrupt:
             print("\n[INFO] Stopped by user.")
@@ -279,6 +361,8 @@ def main():
                 cv2.destroyAllWindows()
             if camera is not None:
                 camera.close()
+            if eef_state_sub is not None:
+                eef_state_sub.close()
 
 
 if __name__ == "__main__":

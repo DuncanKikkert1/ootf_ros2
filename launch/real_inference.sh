@@ -11,6 +11,14 @@
 
 PROJECT_ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 
+# ── Logging ──────────────────────────────────────────────────────────────────
+LOG_DIR="$PROJECT_ROOT/debug/logs/run/real"
+mkdir -p "$LOG_DIR"
+LOG_FILE="$LOG_DIR/$(date +%Y%m%d_%H%M%S).log"
+export PYTHONUNBUFFERED=1
+exec > >(stdbuf -oL tee -a "$LOG_FILE") 2>&1
+echo "Logging to $LOG_FILE"
+
 # ── Detect ROS distro ────────────────────────────────────────────────────────
 if [ -z "$ROS_DISTRO" ]; then
     ROS_DISTRO=$(ls /opt/ros/ 2>/dev/null | head -1)
@@ -28,6 +36,7 @@ done
 source "/opt/ros/$ROS_DISTRO/setup.bash"
 export ROS_DISTRO
 export RMW_IMPLEMENTATION=rmw_fastrtps_cpp
+export PYTHONPATH="$PROJECT_ROOT/src/comm:$PYTHONPATH"
 
 echo "Using ROS_DISTRO : $ROS_DISTRO"
 echo "Using Octo       : $OCTO_PY"
