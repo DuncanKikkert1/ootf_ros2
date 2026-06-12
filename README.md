@@ -195,6 +195,29 @@ Run individual phases:
 ./run.sh pipeline --output-dir data/exp_01 --finetune-only   # finetune only
 ```
 
+### Overfit sanity check
+To prove the pipeline works end to end, train on episodes that are *fully*
+identical and verify the model replays them. Both flags are required —
+`--overfit` on collection pins every per-episode sampling source (object type,
+instruction, yaw, pick **and place** position, domain rand); `--overfit` on
+finetune disables augmentation/weight decay and keeps every dwell frame:
+
+```bash
+./run.sh pipeline --output-dir data/exp_overfit --collect-only \
+    --n-episodes 20 --action-stride 12 --overfit
+./run.sh pipeline --output-dir data/exp_overfit --finetune-only \
+    --finetune-mode full --n-finetune-steps 20000 --overfit
+./run.sh debug policy        # open-loop: correlations ≈ 1 expected on train data
+./run.sh debug replay        # controller-only: GT actions must track within ~2 cm
+./run.sh sim --instruction "pick up the cube and place it on the conveyor" \
+    --no-temporal-ensemble   # closed-loop replay of the memorised trajectory
+```
+
+Fixing only `--pick-x/--pick-y/--fixed-yaw/--no-domain-rand` is **not**
+sufficient: object type, language instruction, and place position are still
+sampled per episode, giving the model several different behaviours to
+memorise under one task.
+
 ### Sim inference — Isaac Sim + Octo VLA
 ```bash
 ./run.sh sim --instruction "pick up the object"
@@ -211,6 +234,9 @@ Run individual phases:
 ./run.sh debug policy --n-episodes 20
 ./run.sh debug policy --pretrained # compare against base pretrained model
 ./run.sh debug policy --step 10000 # evaluate a specific checkpoint step
+
+./run.sh debug replay              # replay GT actions through the sim (action → motion)
+./run.sh debug replay --npz data/exp_01/raw/episode_000000.npz
 
 ./run.sh debug sim                 # start Isaac Sim node in isolation
 ./run.sh debug bridge              # start TCP→ROS2 bridge in isolation

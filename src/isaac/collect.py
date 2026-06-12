@@ -259,6 +259,12 @@ class DataCollector:
             print("[COLLECT] wrist_cam.initialize() ...", flush=True)
         wrist_cam.initialize()
 
+        # Auto-exposure warm-up: the first rendered frames are overexposed
+        # (frame-0 mean ~204/255 vs ~148 steady-state), polluting the first
+        # recorded step of episode 0 with an image inference never produces.
+        for _ in range(30):
+            world.step(render=True)
+
         # PhysX TGS solver changed behaviour for velocity_iteration_count > 4.
         # /World/Pickables/Cube and /World/h2017/root_joint both exceed that limit
         # in the USD asset; cap them here after world.reset() to silence the warning.
@@ -999,6 +1005,13 @@ def parse_args():
                     help="Disable all domain randomization: fixed lighting, fixed object "
                          "colours, no Replicator steps. Use for overfit/debug runs where "
                          "every episode must look identical.")
+    ap.add_argument("--overfit", action="store_true",
+                    help="Fully deterministic episodes for overfit/debug runs. Fixes ALL "
+                         "per-episode sampling: forces cube object, fixed instruction, "
+                         "yaw 0, no domain rand, and collapses pick AND place ranges to "
+                         "their midpoints. Values passed explicitly are kept. Without this, "
+                         "object type, instruction, and place position still vary per "
+                         "episode even when pick-x/pick-y are fixed.")
     ap.add_argument("--instruction",    type=str, default=None,
                     help="Fix the language instruction for every episode instead of "
                          "sampling randomly from the default pool. Use for overfit runs.")
@@ -1010,6 +1023,29 @@ def parse_args():
 def main():
     import traceback as _tb
     args = parse_args()
+
+    if args.overfit:
+        # Pin every per-episode sampling source so all episodes are identical.
+        # The exp_overfit_04 run showed that fixing only pick-x/pick-y/yaw still
+        # leaves object type (cube/cylinder/pyramid), instruction, and place
+        # position random — three different behaviours under one task label.
+        _mid = lambda r: [(r[0] + r[1]) / 2.0] * 2
+        args.pick_x  = _mid(args.pick_x)
+        args.pick_y  = _mid(args.pick_y)
+        args.place_x = _mid(args.place_x)
+        args.place_y = _mid(args.place_y)
+        args.no_domain_rand = True
+        if args.fixed_yaw is None:
+            args.fixed_yaw = 0.0
+        if args.forced_obj_sequence is None:
+            args.forced_obj_sequence = ["cube"]
+        if args.instruction is None:
+            args.instruction = "pick up the cube and place it on the conveyor"
+        print(f"[COLLECT] OVERFIT MODE: obj={args.forced_obj_sequence}  "
+              f"yaw={args.fixed_yaw}  pick=({args.pick_x[0]:.4f}, {args.pick_y[0]:.4f})  "
+              f"place=({args.place_x[0]:.4f}, {args.place_y[0]:.4f})  "
+              f"instruction='{args.instruction}'  domain-rand=off", flush=True)
+
     from isaacsim import SimulationApp
     simulation_app = SimulationApp({"headless": True})
     _failed = False

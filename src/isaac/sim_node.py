@@ -42,11 +42,12 @@ URDF_PATH      = Path(__file__).parent.parent.parent / "scenes" / "h2017" / "urd
 LULA_DESC      = Path(__file__).parent.parent.parent / "scenes" / "h2017" / "urdf" / "h2017_lula.yaml"
 JOINT_NAMES    = ['joint_1', 'joint_2', 'joint_3', 'joint_4', 'joint_5', 'joint_6']
 HOME_POSITION  = [0.0, 0.0, 1.57, 0.0, 1.57, 0.0]
-MAX_POS        = 0.20   # m — EEF delta safety clamp per step; matches training data max (stride-12)
+MAX_POS        = 0.22   # m — EEF delta safety clamp per step; stride-12 training data peaks at 0.207, clamp must sit above it
 MAX_ROT        = 0.15   # rad — rotation clamp (relaxed; stride-12 wrist rotations can exceed 0.05)
 ROT_EMA_ALPHA  = 1.0    # EMA smoothing for rotation (1.0 = raw model output, no smoothing)
 MIN_EEF_Z_WORLD  = 0.40  # m — world-frame EEF floor; prevents arm crashing into pallet surface (~0.43 m)
 ACTION_SUBSTEPS  = 12    # physics frames per training action stride — spread each delta across all frames
+IK_FAIL_HOME_AFTER = 15  # consecutive IK failures before returning to HOME to break the frozen-scene stall
 
 # Pickup cube — created programmatically to match collect.py exactly.
 # Same prim path, scale, and mass as DataCollector so the live scene object
@@ -289,10 +290,11 @@ _q_delta_step   = np.zeros(len(JOINT_NAMES))   # per-frame joint velocity for ex
 # -----------------------------------------------------------------------------
 # Simulation loop
 # -----------------------------------------------------------------------------
-_gripper_state = False   # tracks last commanded state
-_loop_count    = 0
-_clamp_count   = 0
-_action_count  = 0
+_gripper_state  = False   # tracks last commanded state
+_loop_count     = 0
+_clamp_count    = 0
+_action_count   = 0
+_ik_fail_streak = 0       # consecutive IK failures; reset on success
 
 while simulation_app.is_running():
     rclpy.spin_once(ros_node, timeout_sec=0)
@@ -335,42 +337,68 @@ while simulation_app.is_running():
 
         q_now = robot.get_joint_positions()
         ee_pos, ee_rot_mat = ik_solver.compute_forward_kinematics(EE_FRAME, q_now)
-
-        target_pos  = ee_pos + np.array([dx, dy, dz])
-
-        # Safety floor: convert target to world frame, clamp Z, convert back.
-        # Prevents imperfect model rollouts from driving the arm into the pallet.
         _base_pos, _base_quat = robot.get_world_pose()
         _base_mat = Rotation.from_quat([_base_quat[1], _base_quat[2],
                                          _base_quat[3], _base_quat[0]]).as_matrix()
-        _target_world = _base_pos + _base_mat @ target_pos
-        if _target_world[2] < MIN_EEF_Z_WORLD:
-            _target_world[2] = MIN_EEF_Z_WORLD
-            target_pos = _base_mat.T @ (_target_world - _base_pos)
-            ros_node.get_logger().warn(
-                f"[SAFETY] EEF Z floor: world Z clamped to {MIN_EEF_Z_WORLD:.2f} m"
+
+        # IK retry at progressively halved deltas: a failing target is usually
+        # just outside the workspace or joint limits, and a smaller step in the
+        # same direction often solves.  Without this every failure freezes the
+        # arm, the camera image stops changing, the policy reproduces the same
+        # out-of-distribution action, and the rollout is stuck permanently.
+        success = False
+        for _scale in (1.0, 0.5, 0.25):
+            target_pos = ee_pos + _scale * np.array([dx, dy, dz])
+
+            # Safety floor: convert target to world frame, clamp Z, convert back.
+            # Prevents imperfect model rollouts from driving the arm into the pallet.
+            _target_world = _base_pos + _base_mat @ target_pos
+            if _target_world[2] < MIN_EEF_Z_WORLD:
+                _target_world[2] = MIN_EEF_Z_WORLD
+                target_pos = _base_mat.T @ (_target_world - _base_pos)
+                ros_node.get_logger().warn(
+                    f"[SAFETY] EEF Z floor: world Z clamped to {MIN_EEF_Z_WORLD:.2f} m"
+                )
+
+            xyzw        = (Rotation.from_euler('xyz', [_scale * drx, _scale * dry, _scale * drz]) *
+                           Rotation.from_matrix(ee_rot_mat)).as_quat()
+            target_quat = xyzw[[3, 0, 1, 2]]
+
+            q_target, success = ik_solver.compute_inverse_kinematics(
+                EE_FRAME, target_pos, target_quat,
+                position_tolerance=0.005,
+                orientation_tolerance=0.01,
+                warm_start=q_now,
             )
+            if success:
+                if _scale < 1.0:
+                    ros_node.get_logger().warn(f"[IK] solved at {_scale:.2f}x delta after retry")
+                break
 
-        xyzw        = (Rotation.from_euler('xyz', [drx, dry, drz]) *
-                       Rotation.from_matrix(ee_rot_mat)).as_quat()
-        target_quat = xyzw[[3, 0, 1, 2]]
-
-        q_target, success = ik_solver.compute_inverse_kinematics(
-            EE_FRAME, target_pos, target_quat,
-            position_tolerance=0.005,
-            orientation_tolerance=0.01,
-            warm_start=q_now,
-        )
         if success:
             # Solve IK once for the full delta, then interpolate in joint space.
             # Interpolating in joint space avoids re-running IK on sub-moves that
             # fall inside the solver tolerance and would return unchanged poses.
+            _ik_fail_streak  = 0
             _joint_substeps  = np.linspace(q_now, q_target, ACTION_SUBSTEPS + 1)[1:]
             _q_delta_step[:] = (q_target - q_now) / ACTION_SUBSTEPS
             _substep_idx     = 0
         else:
-            ros_node.get_logger().warn("[IK] IK failed — skipping action")
+            _ik_fail_streak += 1
+            ros_node.get_logger().warn(
+                f"[IK] IK failed at 1x/0.5x/0.25x delta — skipping action "
+                f"(streak {_ik_fail_streak}/{IK_FAIL_HOME_AFTER})"
+            )
             _joint_substeps = None
+            if _ik_fail_streak >= IK_FAIL_HOME_AFTER:
+                ros_node.get_logger().warn(
+                    f"[IK] {IK_FAIL_HOME_AFTER} consecutive IK failures — "
+                    f"returning to HOME to break the stall"
+                )
+                robot.get_articulation_controller().apply_action(
+                    ArticulationAction(joint_positions=HOME_POSITION)
+                )
+                _ik_fail_streak = 0
 
     if _joint_substeps is not None:
         if _substep_idx < ACTION_SUBSTEPS:

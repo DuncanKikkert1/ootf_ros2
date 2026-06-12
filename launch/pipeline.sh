@@ -32,7 +32,9 @@ while [[ $# -gt 0 ]]; do
         --collect-and-train-head)           PHASE="collect-train-head";    shift   ;;
         --pretrained-path|--finetune-mode)  TRAIN_ARGS+=("$1" "$2");      shift 2 ;;
         --n-finetune-steps|--batch-size)    TRAIN_ARGS+=("$1" "$2");      shift 2 ;;
-        --overfit)                          TRAIN_ARGS+=("$1");            shift   ;;
+        # --overfit drives the whole chain: deterministic episodes in collect.py
+        # AND no-augmentation/zero-wd/keep-dwell-frames in pipeline.py.
+        --overfit)                          TRAIN_ARGS+=("$1"); COLLECT_ARGS+=("$1"); shift ;;
         --head-raw-dir)                     HEAD_RAW_DIR="$2";             shift 2 ;;
         --head-model-path)                  HEAD_ARGS+=("--model-path" "$2"); shift 2 ;;
         --head-batch-size)                  HEAD_ARGS+=("--batch-size" "$2"); shift 2 ;;

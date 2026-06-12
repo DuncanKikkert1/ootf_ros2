@@ -98,6 +98,20 @@ print(os.path.join(os.path.dirname(isaacsim.__file__), 'exts', 'isaacsim.ros2.br
         python3 "$PROJECT_ROOT/debug/debug_gripper.py" 2>&1 | tee "$LOG"
         ;;
 
+    replay)
+        # ── GT action replay (requires sim to be running) ─────────────────────
+        source "/opt/ros/$ROS_DISTRO/setup.bash"
+        export ROS_DISTRO
+        export RMW_IMPLEMENTATION=rmw_fastrtps_cpp
+
+        mkdir -p "$LOG_DIR/replay"
+        LOG="$LOG_DIR/replay/replay_${TIMESTAMP}.log"
+        echo "Running GT action replay  (ROS_DISTRO=$ROS_DISTRO)"
+        echo "Logging to $LOG"
+        shift   # drop "replay" so remaining args (--npz, --step-delay, …) pass through
+        python3 "$PROJECT_ROOT/debug/debug_replay.py" "$@" 2>&1 | tee "$LOG"
+        ;;
+
     collect)
         # ── Dry-run episode collector (no files written) ─────────────────────
         ISAAC_PY=""
@@ -130,7 +144,7 @@ print(os.path.join(os.path.dirname(isaacsim.__file__), 'exts', 'isaacsim.ros2.br
 
     *)
         echo "ERROR: Unknown component '$COMPONENT'."
-        echo "Usage: bash launch/debug.sh [sim|bridge|joint|collect|policy]"
+        echo "Usage: bash launch/debug.sh [sim|bridge|joint|collect|policy|replay|gripper-test]"
         exit 1
         ;;
 esac

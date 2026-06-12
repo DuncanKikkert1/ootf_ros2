@@ -78,7 +78,10 @@ class OctoFinetuner:
             **os.environ,
             "TFDS_MODULES_IMPORT": "training.tfds_builder",
             "PYTHONPATH": f"{src_dir}{os.pathsep}{os.environ.get('PYTHONPATH', '')}",
-            "WANDB_MODE": "disabled",
+            # Offline (not disabled): Octo's finetune.py logs losses only through
+            # wandb, so disabling it leaves no record of whether training converged.
+            # Offline runs land in ./wandb and can be inspected with `wandb sync`.
+            "WANDB_MODE": os.environ.get("WANDB_MODE", "offline"),
             "OOTF_OVERFIT": "1" if self.overfit else "0",
         }
         config      = Path(__file__).parent / "finetune_config.py"
@@ -140,6 +143,13 @@ def main() -> None:
     out      = Path(args.output_dir)
     tfds_dir = out / "tfds"
     ckpt_dir = out / "checkpoint"
+
+    # tfds_builder reads OOTF_OVERFIT at import time to pick the dwell-frame
+    # subsample rate.  The conversion runs in THIS process, not the finetune
+    # subprocess, so the flag must be set here before the builder is imported —
+    # otherwise --overfit still drops 4 of 5 dwell frames during conversion.
+    if args.overfit:
+        os.environ["OOTF_OVERFIT"] = "1"
 
     if not args.finetune_only:
         DatasetConverter(raw_dir=args.raw_dir, tfds_dir=tfds_dir).run()
