@@ -27,6 +27,24 @@ def _quat_eef_down_yaw(yaw: float) -> np.ndarray:
     return np.array([xyzw[3], xyzw[0], xyzw[1], xyzw[2]])
 
 
+def _fold_yaw(yaw: float, obj_type: str) -> float:
+    """Fold an EEF yaw target into the object's rotational-symmetry domain.
+
+    A training label is only learnable when it is a function of the image.  A
+    cube looks identical at yaw offsets of 90°, so a full-circle yaw target
+    gives the same observation up to four conflicting rotation labels — the
+    diffusion head then outputs multimodal noise (observed in exp_10).  Folding
+    the EEF target to the nearest symmetry-equivalent restores a one-to-one
+    image→target mapping; the object itself keeps its raw sampled yaw, so the
+    visual diversity is unchanged.  Pyramids are asymmetric → no folding.
+    """
+    if obj_type == 'cylinder':
+        return 0.0                                            # full symmetry
+    if obj_type == 'cube':
+        return ((yaw + np.pi / 4) % (np.pi / 2)) - np.pi / 4  # [-45°, +45°)
+    return yaw
+
+
 def _quat_for_face_normal(n_outward: np.ndarray) -> np.ndarray:
     """wxyz quaternion aligning gripper +Z with the inward face normal (-n_outward).
 
@@ -398,6 +416,9 @@ class PickAndPlaceTask:
                         'face_axis': face_axis, 'side': side,
                         'n_outward': n_outward}
 
+        # Fold the EEF yaw target to the object's symmetry — the object prim
+        # keeps the raw yaw (set in collect.py), only the wrist target folds.
+        pick_yaw  = _fold_yaw(pick_yaw, obj_type)
         params    = _OBJ_PARAMS[obj_type]
         hh        = params['height'] / 2.0
         pick_pos  = np.array([*pick_xy,  self.surface_z + hh])
@@ -731,6 +752,9 @@ class SortingTask(PickAndPlaceTask):
                         'face_axis': face_axis, 'side': side,
                         'n_outward': n_outward}
 
+        # Fold the EEF yaw target to the object's symmetry — the object prim
+        # keeps the raw yaw (set in collect.py), only the wrist target folds.
+        pick_yaw  = _fold_yaw(pick_yaw, obj_type)
         params    = _OBJ_PARAMS[obj_type]
         hh        = params['height'] / 2.0
         pick_pos  = np.array([*pick_xy,  self.surface_z + hh])

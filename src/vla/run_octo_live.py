@@ -167,6 +167,13 @@ def parse_args():
                     help="Consecutive sub-threshold grip predictions required to open. "
                          "Debounces diffusion sampling noise so a single low sample "
                          "cannot drop the object mid-transfer (default: 3)")
+    ap.add_argument("--zero-rotation", action="store_true",
+                    help="Zero the rotation dims (drx/dry/drz) of every action before "
+                         "sending. Use for yaw-symmetric objects (cube + suction "
+                         "gripper) when training data contained random yaw: the yaw "
+                         "target is unobservable from images (90-degree symmetry), so "
+                         "the rotation head outputs multimodal noise that spins the "
+                         "wrist camera and derails position servoing.")
     ap.add_argument("--grip-hold-steps", type=int, default=3,
                     help="Once the gripper closes, hold it closed for at least this many "
                          "steps regardless of model output. Gives the surface gripper time "
@@ -340,6 +347,9 @@ def main():
                     # into the current step 4 steps early, causing the gripper to fire
                     # before the arm reaches the cube.  Use the raw current prediction.
                     action[6] = chunk[0][6]
+
+                if args.zero_rotation:
+                    action[3:6] = 0.0
 
                 # Schmitt-trigger gripper: close above grip_threshold; once
                 # closed, open only after grip_open_steps consecutive
