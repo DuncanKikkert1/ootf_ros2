@@ -190,17 +190,21 @@ class PickAndPlaceTask:
 
     OBJ_TYPES = list(_OBJ_PARAMS) + ['pyramid']
 
+    # {obj} is filled with the episode's object type (cube/cylinder/pyramid) so
+    # the language carries information: identical scenes with different
+    # instructions demand different behaviour, which keeps the pretrained
+    # language→action pathway load-bearing instead of learned-to-be-ignored.
     DEFAULT_INSTRUCTIONS = [
-        "pick up the object from the pallet and place it on the conveyor",
-        "grasp the object and move it to the conveyor belt",
-        "pick up the item from the pallet and place it on the belt",
-        "move the object from the pallet to the conveyor",
-        "pick and place the object onto the conveyor belt",
-        "grab the item on the pallet and drop it on the conveyor",
-        "transfer the object from the pallet to the belt",
-        "take the item and put it on the conveyor",
-        "pick the object off the pallet and set it on the belt",
-        "move the item from the pallet onto the belt",
+        "pick up the {obj} from the pallet and place it on the conveyor",
+        "grasp the {obj} and move it to the conveyor belt",
+        "pick up the {obj} from the pallet and place it on the belt",
+        "move the {obj} from the pallet to the conveyor",
+        "pick and place the {obj} onto the conveyor belt",
+        "grab the {obj} on the pallet and drop it on the conveyor",
+        "transfer the {obj} from the pallet to the belt",
+        "take the {obj} and put it on the conveyor",
+        "pick the {obj} off the pallet and set it on the belt",
+        "move the {obj} from the pallet onto the belt",
     ]
 
     def __init__(
@@ -344,6 +348,15 @@ class PickAndPlaceTask:
                       f"dist_home={best_dist:.3f}", flush=True)
         return best_triple
 
+    @staticmethod
+    def _format_instruction(template: str, obj_type: str) -> str:
+        """Fill the {obj} placeholder with the episode's object type.
+
+        Uses str.replace so fixed instructions without a placeholder
+        (e.g. a CLI --instruction override) pass through unchanged.
+        """
+        return template.replace("{obj}", obj_type)
+
     def sample(self, rng: np.random.Generator, ik,
                robot_world_pos: np.ndarray, robot_R: np.ndarray,
                ee_frame: str = 'link_6',
@@ -379,7 +392,8 @@ class PickAndPlaceTask:
                     pick_pos, place_pos, L, W, H, face_axis, side, n_outward,
                     ik, robot_world_pos, robot_R, ee_frame, ik_place=ik_place,
                 )
-                return waypoints, instruction, pick_pos, place_pos, 'pyramid', \
+                return waypoints, self._format_instruction(instruction, 'pyramid'), \
+                       pick_pos, place_pos, 'pyramid', \
                        {'pool_idx': pool_idx, 'L': L, 'W': W, 'H': H,
                         'face_axis': face_axis, 'side': side,
                         'n_outward': n_outward}
@@ -392,7 +406,8 @@ class PickAndPlaceTask:
             pick_pos, place_pos, params, ik, robot_world_pos, robot_R, ee_frame,
             ik_place=ik_place, pick_yaw=pick_yaw,
         )
-        return waypoints, instruction, pick_pos, place_pos, obj_type, {}
+        return waypoints, self._format_instruction(instruction, obj_type), \
+               pick_pos, place_pos, obj_type, {}
 
     # ── waypoint builders ──────────────────────────────────────────────────────
 
@@ -633,17 +648,20 @@ _SORT_SURFACE_Z = 0.860   # platform top surface = centre_z + half-thickness
 class SortingTask(PickAndPlaceTask):
     """Pick-and-sort variant: each object type has a fixed designated platform on the belt."""
 
+    # {obj} is filled with the episode's object type.  Naming the object is
+    # essential here: the designated platform depends on the object type, so
+    # without it the instruction never disambiguates the goal.
     SORT_INSTRUCTIONS = [
-        "place the object on its designated platform on the belt",
-        "sort the object to its correct platform on the conveyor",
-        "move the object to its matching target platform",
-        "pick up the object and put it on the right slot on the belt",
-        "place the item on its correct platform",
-        "find the right platform and place the object on it",
-        "sort the item to its designated spot on the conveyor",
-        "deliver the object to its assigned platform on the belt",
-        "pick the object and sort it to the correct platform",
-        "move the item to its designated platform on the conveyor",
+        "place the {obj} on its designated platform on the belt",
+        "sort the {obj} to its correct platform on the conveyor",
+        "move the {obj} to its matching target platform",
+        "pick up the {obj} and put it on the right slot on the belt",
+        "place the {obj} on its correct platform",
+        "find the right platform and place the {obj} on it",
+        "sort the {obj} to its designated spot on the conveyor",
+        "deliver the {obj} to its assigned platform on the belt",
+        "pick the {obj} and sort it to the correct platform",
+        "move the {obj} to its designated platform on the conveyor",
     ]
 
     def __init__(self, **kwargs):
@@ -693,7 +711,8 @@ class SortingTask(PickAndPlaceTask):
                 _l6_xy  = place_xy + self.eef_z_offset * n_outward[:2]
                 _l6_rxy = _l6_xy   - robot_world_pos[:2]
                 if np.linalg.norm(_l6_rxy) > self.max_reach_xy:
-                    return None, instruction, pick_pos, place_pos, 'pyramid', \
+                    return None, self._format_instruction(instruction, 'pyramid'), \
+                           pick_pos, place_pos, 'pyramid', \
                            {'pool_idx': pool_idx, 'L': L, 'W': W, 'H': H,
                             'face_axis': face_axis, 'side': side,
                             'n_outward': n_outward}
@@ -706,7 +725,8 @@ class SortingTask(PickAndPlaceTask):
                     ik, robot_world_pos, robot_R, ee_frame,
                     ik_place=ik_place, ik_pre_place=ik_place,
                 )
-                return waypoints, instruction, pick_pos, place_pos, 'pyramid', \
+                return waypoints, self._format_instruction(instruction, 'pyramid'), \
+                       pick_pos, place_pos, 'pyramid', \
                        {'pool_idx': pool_idx, 'L': L, 'W': W, 'H': H,
                         'face_axis': face_axis, 'side': side,
                         'n_outward': n_outward}
@@ -719,4 +739,5 @@ class SortingTask(PickAndPlaceTask):
             pick_pos, place_pos, params, ik, robot_world_pos, robot_R, ee_frame,
             ik_place=ik_place, pick_yaw=pick_yaw,
         )
-        return waypoints, instruction, pick_pos, place_pos, obj_type, {}
+        return waypoints, self._format_instruction(instruction, obj_type), \
+               pick_pos, place_pos, obj_type, {}

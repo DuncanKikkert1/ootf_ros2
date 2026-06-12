@@ -203,14 +203,23 @@ instruction, yaw, pick **and place** position, domain rand); `--overfit` on
 finetune disables augmentation/weight decay and keeps every dwell frame:
 
 ```bash
-./run.sh pipeline --output-dir data/exp_overfit --collect-only \
-    --n-episodes 20 --action-stride 12 --overfit
-./run.sh pipeline --output-dir data/exp_overfit --finetune-only \
-    --finetune-mode full --n-finetune-steps 20000 --overfit
+./run.sh pipeline --output-dir data/exp_overfit --n-episodes 20 --overfit \
+    --finetune-mode full --n-finetune-steps 20000
 ./run.sh debug policy        # open-loop: correlations ≈ 1 expected on train data
 ./run.sh debug replay        # controller-only: GT actions must track within ~2 cm
 ./run.sh sim --instruction "pick up the cube and place it on the conveyor" \
     --no-temporal-ensemble   # closed-loop replay of the memorised trajectory
+```
+
+When running the phases separately, all three are needed and **each** needs
+`--overfit` (collect: deterministic episodes; convert: keep dwell frames;
+finetune: no augmentation, zero weight decay):
+
+```bash
+./run.sh pipeline --output-dir data/exp_overfit --collect-only  --n-episodes 20 --overfit
+./run.sh pipeline --output-dir data/exp_overfit --convert-only  --overfit
+./run.sh pipeline --output-dir data/exp_overfit --finetune-only --overfit \
+    --finetune-mode full --n-finetune-steps 20000
 ```
 
 Fixing only `--pick-x/--pick-y/--fixed-yaw/--no-domain-rand` is **not**

@@ -1014,7 +1014,9 @@ def parse_args():
                          "episode even when pick-x/pick-y are fixed.")
     ap.add_argument("--instruction",    type=str, default=None,
                     help="Fix the language instruction for every episode instead of "
-                         "sampling randomly from the default pool. Use for overfit runs.")
+                         "sampling randomly from the default pool. Use for overfit runs. "
+                         "May contain {obj}, which is replaced by the episode's object "
+                         "type (cube/cylinder/pyramid).")
     ap.add_argument("--verbose", action="store_true",
                     help="Print diagnostic logs (gripper, IK, raycast). Off by default.")
     return ap.parse_args()
