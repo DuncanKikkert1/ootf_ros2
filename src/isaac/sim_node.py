@@ -42,18 +42,22 @@ URDF_PATH      = Path(__file__).parent.parent.parent / "scenes" / "h2017" / "urd
 LULA_DESC      = Path(__file__).parent.parent.parent / "scenes" / "h2017" / "urdf" / "h2017_lula.yaml"
 JOINT_NAMES    = ['joint_1', 'joint_2', 'joint_3', 'joint_4', 'joint_5', 'joint_6']
 HOME_POSITION  = [0.0, 0.0, 1.57, 0.0, 1.57, 0.0]
-MAX_POS        = 0.22   # m — EEF delta safety clamp per step; stride-12 training data peaks at 0.207, clamp must sit above it
+MAX_POS        = 0.25   # m — EEF delta safety clamp per step; stride-12 training data peaks at 0.222, clamp must sit above it
 MAX_ROT        = 0.15   # rad — rotation clamp (relaxed; stride-12 wrist rotations can exceed 0.05)
 ROT_EMA_ALPHA  = 1.0    # EMA smoothing for rotation (1.0 = raw model output, no smoothing)
 MIN_EEF_Z_WORLD  = 0.40  # m — world-frame EEF floor; prevents arm crashing into pallet surface (~0.43 m)
 ACTION_SUBSTEPS  = 12    # physics frames per training action stride — spread each delta across all frames
 IK_FAIL_HOME_AFTER = 15  # consecutive IK failures before returning to HOME to break the frozen-scene stall
+CMD_REBASE_DIST  = 0.10  # m — re-base the command chain from actual pose when the arm diverges this far
+GRIP_SETTLE_QD   = 0.05  # rad/s — fire gripper.close() only below this joint speed (settle-then-grip)
 
 # Pickup cube — created programmatically to match collect.py exactly.
 # Same prim path, scale, and mass as DataCollector so the live scene object
 # is visually identical to what the model was trained on.
+# Position must match the collection run: collect.py --overfit collapses the
+# default pick ranges to their midpoints (0.925, 0.25); z = surface_z + hh.
 PICKUP_PRIM_PATH    = "/World/pick_cube"
-PICKUP_POSITION     = [1.04598, 0.53071, 0.47985]   # nominal pick centre
+PICKUP_POSITION     = [0.925, 0.25, 0.48]   # nominal pick centre
 PICKUP_XY_VARIATION = 0.00   # m — set >0 to add XY jitter; 0.0 for overfit/debug runs
 PICKUP_ORIENT_WXYZ  = [1.0, 0.0, 0.0, 0.0]   # identity — no rotation
 CUBE_HEIGHT         = 0.10   # m — must match _OBJ_PARAMS['cube']['height'] in task.py
@@ -116,6 +120,19 @@ for _smc_prim in _smc_stage.Traverse():
             _smc_attr.Set(False)
             _smc_n += 1
 print(f"[SCENE] SMC gripper: disabled {_smc_n} collision prim(s) — scan path cleared")
+
+# Diagnostic: list every collision shape still active under link_6.  Anything
+# in this list can physically strike the pick object during the final approach.
+_col_on = []
+for _cp in _smc_stage.Traverse():
+    _cpath = str(_cp.GetPath())
+    if _cpath.startswith("/World/h2017/link_6"):
+        _ca = _cp.GetAttribute("physics:collisionEnabled")
+        if _ca.IsValid() and _ca.Get():
+            _col_on.append(_cpath)
+print(f"[SCENE] link_6 collision prims still ENABLED: {len(_col_on)}")
+for _cpath in _col_on:
+    print(f"[SCENE]   {_cpath}")
 
 # -----------------------------------------------------------------------------
 # Physics world + robot
@@ -295,6 +312,11 @@ _loop_count     = 0
 _clamp_count    = 0
 _action_count   = 0
 _ik_fail_streak = 0       # consecutive IK failures; reset on success
+_q_cmd_prev     = None    # last commanded IK joint target — the command-chain base
+_cube_watch_home = np.array(PICKUP_POSITION, dtype=float)   # cube rest position
+_cube_alarmed    = False  # one-shot: fired when the cube first leaves its spot
+_open_pending    = False  # deferred gripper open — fires once the arm settles
+_open_deadline   = 0      # frame cap so a pending open can never stall forever
 
 while simulation_app.is_running():
     rclpy.spin_once(ros_node, timeout_sec=0)
@@ -310,10 +332,30 @@ while simulation_app.is_running():
         if new_state != _gripper_state:
             _gripper_state = new_state
             if not _gripper_state:
-                gripper.open()
+                # Settle-then-release, mirroring collection: the open command
+                # arrives while the arm is still descending into the place pose
+                # (PD lag), and releasing mid-descent drops the object from the
+                # remaining lag distance.  Defer until the arm settles, with a
+                # frame cap as fail-safe.
+                _open_pending  = True
+                _open_deadline = _loop_count + 60
+            else:
+                _open_pending = False   # close supersedes a still-pending open
 
-    if _gripper_state:
-        gripper.close()
+    if _open_pending:
+        if (np.max(np.abs(robot.get_joint_velocities())) < GRIP_SETTLE_QD
+                or _loop_count >= _open_deadline):
+            gripper.open()
+            _open_pending = False
+
+    if _gripper_state and gripper.status() != "closed":
+        # Settle-then-grip, mirroring collect.py's protocol: firing the surface
+        # gripper while the kinematic body is still moving causes repeated
+        # attachment failures that shove the object off the pallet (observed
+        # via CUBE-WATCH) and can wedge the extension in a non-responsive Open
+        # state.  Once latched, the D6 joint persists without further calls.
+        if np.max(np.abs(robot.get_joint_velocities())) < GRIP_SETTLE_QD:
+            gripper.close()
 
     if ros_node.eef_delta is not None:
         raw = np.array(ros_node.eef_delta[:6])
@@ -336,7 +378,28 @@ while simulation_app.is_running():
         drx, dry, drz = _smoothed_rot
 
         q_now = robot.get_joint_positions()
-        ee_pos, ee_rot_mat = ik_solver.compute_forward_kinematics(EE_FRAME, q_now)
+        ee_act_pos, _ = ik_solver.compute_forward_kinematics(EE_FRAME, q_now)
+
+        # Chain new targets from the PREVIOUS COMMANDED target, not the actual
+        # joints.  The PD controller lags ~6-8 frames behind its command during
+        # motion (tau ≈ kd/kp = 0.1 s); basing each delta on the lagging actual
+        # pose permanently discards that distance on every action (~40% of each
+        # delta at stride speed, measured via GT replay).  Collection commanded
+        # continuous ramps that marched on regardless of lag, so chaining
+        # reproduces the trajectories the model was trained on.  Re-base from
+        # the actual pose when command and arm diverge (IK failures, clamps).
+        base_q = q_now
+        if _q_cmd_prev is not None:
+            _cmd_pos, _ = ik_solver.compute_forward_kinematics(EE_FRAME, _q_cmd_prev)
+            if np.linalg.norm(_cmd_pos - ee_act_pos) <= CMD_REBASE_DIST:
+                base_q = _q_cmd_prev
+            else:
+                ros_node.get_logger().warn(
+                    f"[CMD] arm {np.linalg.norm(_cmd_pos - ee_act_pos):.3f} m behind "
+                    f"command target — re-basing from actual pose"
+                )
+
+        ee_pos, ee_rot_mat = ik_solver.compute_forward_kinematics(EE_FRAME, base_q)
         _base_pos, _base_quat = robot.get_world_pose()
         _base_mat = Rotation.from_quat([_base_quat[1], _base_quat[2],
                                          _base_quat[3], _base_quat[0]]).as_matrix()
@@ -368,7 +431,7 @@ while simulation_app.is_running():
                 EE_FRAME, target_pos, target_quat,
                 position_tolerance=0.005,
                 orientation_tolerance=0.01,
-                warm_start=q_now,
+                warm_start=base_q,
             )
             if success:
                 if _scale < 1.0:
@@ -376,12 +439,14 @@ while simulation_app.is_running():
                 break
 
         if success:
-            # Solve IK once for the full delta, then interpolate in joint space.
+            # Solve IK once for the full delta, then interpolate in joint space
+            # from the command-chain base so the command stream stays continuous.
             # Interpolating in joint space avoids re-running IK on sub-moves that
             # fall inside the solver tolerance and would return unchanged poses.
             _ik_fail_streak  = 0
-            _joint_substeps  = np.linspace(q_now, q_target, ACTION_SUBSTEPS + 1)[1:]
-            _q_delta_step[:] = (q_target - q_now) / ACTION_SUBSTEPS
+            _q_cmd_prev      = q_target.copy()
+            _joint_substeps  = np.linspace(base_q, q_target, ACTION_SUBSTEPS + 1)[1:]
+            _q_delta_step[:] = (q_target - base_q) / ACTION_SUBSTEPS
             _substep_idx     = 0
         else:
             _ik_fail_streak += 1
@@ -399,6 +464,7 @@ while simulation_app.is_running():
                     ArticulationAction(joint_positions=HOME_POSITION)
                 )
                 _ik_fail_streak = 0
+                _q_cmd_prev     = np.array(HOME_POSITION, dtype=float)
 
     if _joint_substeps is not None:
         if _substep_idx < ACTION_SUBSTEPS:
@@ -423,6 +489,8 @@ while simulation_app.is_running():
         robot.get_articulation_controller().apply_action(
             ArticulationAction(joint_positions=ros_node.joint_positions)
         )
+        # Direct joint command resets the eef_delta command chain to this target.
+        _q_cmd_prev = np.array(ros_node.joint_positions, dtype=float)
 
     ros_node.publish_joint_states(
         positions=robot.get_joint_positions(),
@@ -442,6 +510,8 @@ while simulation_app.is_running():
             )
             _pickup_cube.set_linear_velocity(np.zeros(3))
             _pickup_cube.set_angular_velocity(np.zeros(3))
+            _cube_watch_home = _reset_pos.copy()
+            _cube_alarmed    = False
             print(f"[SCENE] Cube reset to {_reset_pos.round(4)}")
         else:
             print(f"[SCENE] Reset requested but cube prim not found — "
@@ -468,6 +538,23 @@ while simulation_app.is_running():
         world_quat_wxyz=np.array([_sync_l6_xyzw[3], _sync_l6_xyzw[0],
                                    _sync_l6_xyzw[1], _sync_l6_xyzw[2]]),
     )
+
+    # Cube-watch: report the exact frame the pickup cube first leaves its rest
+    # position, with the EEF geometry and gripper state at that moment.  This
+    # discriminates a descent collision (gripper open, tips near cube top) from
+    # an attachment yank (gripper closing) when the cube gets knocked away.
+    if _pickup_cube is not None and not _cube_alarmed:
+        _cw_pos, _ = _pickup_cube.get_world_pose()
+        _cw_disp = np.linalg.norm(_cw_pos - _cube_watch_home)
+        if _cw_disp > 0.03:
+            _cube_alarmed = True
+            print(f"[CUBE-WATCH] frame {_loop_count}: cube moved {_cw_disp*1000:.0f} mm  "
+                  f"cube={np.asarray(_cw_pos).round(4)}  "
+                  f"link6_world={_sync_l6_pos.round(4)}  "
+                  f"tips_z≈{_sync_l6_pos[2] - 0.215:.4f}  "
+                  f"cube_top={_cube_watch_home[2] + CUBE_HEIGHT / 2:.4f}  "
+                  f"gripper={'close-cmd' if _gripper_state else 'open'}|{gripper.status()}",
+                  flush=True)
 
     world.step(render=True)
     _loop_count += 1

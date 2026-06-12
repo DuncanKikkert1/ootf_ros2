@@ -59,6 +59,7 @@ class ROS2EEFStateSubscriber:
         self.topic   = topic
         self._node   = None
         self._latest = None
+        self._frames = 0   # messages received — sim publishes one per render frame
 
     def connect(self):
         """Initialise ROS2 and subscribe to the EEF state topic."""
@@ -71,13 +72,31 @@ class ROS2EEFStateSubscriber:
         print(f"[ROS2] Subscribed to EEF state: {self.topic}")
 
     def _callback(self, msg) -> None:
-        self._latest = np.array(msg.data[:7], dtype=np.float32)
+        self._latest  = np.array(msg.data[:7], dtype=np.float32)
+        self._frames += 1
 
     def get_latest(self) -> "np.ndarray | None":
         """Spin once to drain pending messages and return the latest EEF xyz, or None."""
         import rclpy
         rclpy.spin_once(self._node, timeout_sec=0.05)
         return self._latest
+
+    def wait_frames(self, n: int, timeout: float = 5.0) -> bool:
+        """Block until n more /eef_state messages (= sim render frames) arrive.
+
+        Frame-counted pacing stays correct when the sim runs slower than real
+        time; wall-clock pacing silently truncates every action when it does.
+        Returns False on timeout (sim paused or stopped).
+        """
+        import rclpy
+        import time
+        target = self._frames + n
+        end    = time.time() + timeout
+        while self._frames < target:
+            rclpy.spin_once(self._node, timeout_sec=0.05)
+            if time.time() > end:
+                return False
+        return True
 
     def close(self):
         """Destroy the subscriber node."""

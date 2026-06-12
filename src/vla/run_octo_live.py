@@ -128,7 +128,15 @@ def parse_args():
     ap.add_argument("--steps",      type=int,   default=0,
                     help="Number of steps to run (0 = run until Ctrl+C)")
     ap.add_argument("--step-delay", type=float, default=STEP_DELAY,
-                    help=f"Seconds between steps (default: {STEP_DELAY})")
+                    help=f"Seconds between steps (default: {STEP_DELAY}). Only used "
+                         "when frame-synced pacing is unavailable (no /eef_state).")
+    ap.add_argument("--sync-frames", type=int, default=12,
+                    help="Pace steps by waiting for this many /eef_state messages "
+                         "(= sim render frames) after each action — matches the "
+                         "12-frame action stride from training even when the sim "
+                         "runs slower than real time. 0 = wall-clock pacing "
+                         "(silently truncates actions on a slow sim). Requires "
+                         "--ros2-camera. (default: 12)")
     ap.add_argument("--usb-camera",  type=int, default=None, metavar="DEVICE",
                     help="Use a USB webcam instead of MechEye (device index, usually 0)")
     ap.add_argument("--ros2-camera", action="store_true",
@@ -152,6 +160,13 @@ def parse_args():
     ap.add_argument("--grip-threshold", type=float, default=0.9,
                     help="Ensemble grip value must exceed this before closing the gripper. "
                          "Higher values prevent premature closes during approach (default: 0.9)")
+    ap.add_argument("--grip-open-threshold", type=float, default=0.5,
+                    help="Once closed, open only when the grip prediction drops below this "
+                         "value — hysteresis against the close threshold (default: 0.5)")
+    ap.add_argument("--grip-open-steps", type=int, default=3,
+                    help="Consecutive sub-threshold grip predictions required to open. "
+                         "Debounces diffusion sampling noise so a single low sample "
+                         "cannot drop the object mid-transfer (default: 3)")
     ap.add_argument("--grip-hold-steps", type=int, default=3,
                     help="Once the gripper closes, hold it closed for at least this many "
                          "steps regardless of model output. Gives the surface gripper time "
@@ -275,6 +290,7 @@ def main():
         step               = 0
         grip_hold_remaining = 0
         prev_grip           = 0.0
+        low_grip_count      = 0
 
         if args.show_camera:
             cv2.namedWindow("Octo — camera feed", cv2.WINDOW_NORMAL)
@@ -325,8 +341,19 @@ def main():
                     # before the arm reaches the cube.  Use the raw current prediction.
                     action[6] = chunk[0][6]
 
-                # Clamp gripper to binary: close only when ensemble is confident.
-                raw_grip = 1.0 if action[6] > args.grip_threshold else 0.0
+                # Schmitt-trigger gripper: close above grip_threshold; once
+                # closed, open only after grip_open_steps consecutive
+                # predictions below grip_open_threshold.  A single noisy
+                # diffusion sample must not release the object mid-transfer.
+                if prev_grip < 0.5:
+                    raw_grip = 1.0 if action[6] > args.grip_threshold else 0.0
+                    low_grip_count = 0
+                else:
+                    if action[6] < args.grip_open_threshold:
+                        low_grip_count += 1
+                    else:
+                        low_grip_count = 0
+                    raw_grip = 0.0 if low_grip_count >= args.grip_open_steps else 1.0
 
                 # Hold timer: keep gripper closed for grip_hold_steps after first close.
                 if raw_grip > 0.5 and prev_grip < 0.5:
@@ -351,7 +378,15 @@ def main():
                     print(f"[INFO] Reached {args.steps} steps. Done.")
                     break
 
-                time.sleep(args.step_delay)
+                # Frame-synced pacing: wait until the sim has actually executed
+                # the 12 substeps of this action.  Wall-clock sleep undershoots
+                # every action when the sim runs below real time.
+                if eef_state_sub is not None and args.sync_frames > 0:
+                    if not eef_state_sub.wait_frames(args.sync_frames):
+                        print("[WARN] /eef_state stalled — falling back to step delay.")
+                        time.sleep(args.step_delay)
+                else:
+                    time.sleep(args.step_delay)
 
         except KeyboardInterrupt:
             print("\n[INFO] Stopped by user.")

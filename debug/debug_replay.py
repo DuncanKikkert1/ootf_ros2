@@ -28,8 +28,8 @@ import numpy as np
 ROOT       = Path(__file__).parent.parent
 _DATA_ROOT = ROOT / "data"
 
-HOME_POSITION = [0.0, 0.0, 1.57, 0.0, 1.57, 0.0]   # must match sim_node.py
-STEP_DELAY    = 0.2    # s — one action_stride window (12 frames at 60 Hz)
+HOME_POSITION   = [0.0, 0.0, 1.57, 0.0, 1.57, 0.0]   # must match sim_node.py
+ACTION_SUBSTEPS = 12   # physics frames per action — must match sim_node.py
 
 
 def _latest_episode() -> Path | None:
@@ -53,8 +53,15 @@ def parse_args():
     )
     ap.add_argument("--npz", type=str, default=None,
                     help="Episode .npz to replay (default: first episode of latest data/*/raw)")
-    ap.add_argument("--step-delay", type=float, default=STEP_DELAY,
-                    help=f"Seconds between published actions (default: {STEP_DELAY})")
+    ap.add_argument("--frames-per-step", type=int, default=ACTION_SUBSTEPS,
+                    help="Sim frames to wait between actions, counted via /eef_state "
+                         "messages (default: 12 = one action stride). Frame counting "
+                         "keeps pacing correct even when the sim runs slower than "
+                         "real time — wall-clock pacing silently truncates every "
+                         "action when it does.")
+    ap.add_argument("--step-delay", type=float, default=None,
+                    help="Use wall-clock pacing with this many seconds between actions "
+                         "instead of frame counting (legacy behaviour; not recommended)")
     ap.add_argument("--no-reset", action="store_true",
                     help="Skip homing the arm and resetting the scene before replay")
     return ap.parse_args()
@@ -84,20 +91,36 @@ def main():
     delta_pub  = node.create_publisher(Float64MultiArray, "/eef_delta",    10)
     joint_pub  = node.create_publisher(JointState,        "/joint_command", 10)
     reset_pub  = node.create_publisher(Empty,             "/reset_scene",    1)
-    latest_eef = {"v": None}
-    node.create_subscription(
-        Float64MultiArray, "/eef_state",
-        lambda m: latest_eef.update(v=np.array(m.data[:7])), 10,
-    )
+    # /eef_state is published once per sim render frame, so counting messages
+    # counts sim frames — the only pacing that stays correct when the sim runs
+    # slower than real time.
+    eef = {"v": None, "frames": 0}
+
+    def _eef_cb(m):
+        eef["v"]       = np.array(m.data[:7])
+        eef["frames"] += 1
+
+    node.create_subscription(Float64MultiArray, "/eef_state", _eef_cb, 10)
 
     def spin(seconds: float):
         end = time.time() + seconds
         while time.time() < end:
             rclpy.spin_once(node, timeout_sec=0.02)
 
+    def wait_frames(n: int, timeout: float = 5.0):
+        """Block until n more /eef_state messages (= sim frames) arrive."""
+        target = eef["frames"] + n
+        end    = time.time() + timeout
+        while eef["frames"] < target:
+            rclpy.spin_once(node, timeout_sec=0.05)
+            if time.time() > end:
+                print(f"[REPLAY] WARNING: only {eef['frames'] - target + n}/{n} "
+                      f"sim frames within {timeout}s — is the sim paused?")
+                break
+
     try:
         print("[REPLAY] Waiting for /eef_state from sim_node …")
-        while latest_eef["v"] is None:
+        while eef["v"] is None:
             rclpy.spin_once(node, timeout_sec=0.1)
 
         if not args.no_reset:
@@ -109,11 +132,14 @@ def main():
             reset_pub.publish(Empty())
             spin(1.0)
 
-        start_err = np.linalg.norm(latest_eef["v"][:3] - proprios[0][:3])
+        start_err = np.linalg.norm(eef["v"][:3] - proprios[0][:3])
         print(f"[REPLAY] Start pose error vs proprios[0]: {start_err*1000:.1f} mm")
         if start_err > 0.05:
             print("[REPLAY] WARNING: arm is >5 cm from the episode start pose — "
                   "tracking errors below will include this offset.")
+        pacing = (f"wall-clock {args.step_delay}s" if args.step_delay
+                  else f"{args.frames_per_step} sim frames")
+        print(f"[REPLAY] Pacing: {pacing} per action")
 
         pos_errs, rot_errs = [], []
         first_bad = None
@@ -121,9 +147,12 @@ def main():
             msg = Float64MultiArray()
             msg.data = [float(v) for v in actions[k]]
             delta_pub.publish(msg)
-            spin(args.step_delay)
+            if args.step_delay:
+                spin(args.step_delay)
+            else:
+                wait_frames(args.frames_per_step)
 
-            achieved = latest_eef["v"]
+            achieved = eef["v"]
             expected = proprios[k + 1]      # action[k] moves proprios[k] → proprios[k+1]
             p_err = achieved[:3] - expected[:3]
             r_err = _ang_diff(achieved[3:6], expected[3:6])
@@ -147,6 +176,17 @@ def main():
               f"z={np.abs(pos_errs[:,2]).mean()*1000:.1f} mm")
         print(f"Rot error mean  : {np.abs(rot_errs).mean():.4f} rad   "
               f"max: {np.abs(rot_errs).max():.4f} rad")
+        # Errors at the gripper transitions are what decide pick/place success.
+        # Transient lag during fast transfer segments is expected (the arm
+        # trails its command by ~0.1 s, same as during collection); error at
+        # the dwells should be near zero.
+        grip  = actions[: len(pos_errs) + 1, 6]
+        trans = np.where(np.abs(np.diff(grip)) > 0.5)[0]
+        for k in trans:
+            if k < len(pos_errs):
+                kind = "close (pick) " if grip[k + 1] > 0.5 else "open (place)"
+                print(f"Gripper {kind} step {k:3d}: pos error "
+                      f"{np.linalg.norm(pos_errs[k])*1000:.1f} mm")
         if first_bad is not None:
             print(f"First step with pos error > 2 cm: step {first_bad}")
             print("→ controller chain drifts on ground-truth actions; "
