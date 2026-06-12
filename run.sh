@@ -17,10 +17,11 @@ MODE="${1:-}"
 shift 2>/dev/null || true
 
 case "$MODE" in
-    pipeline) bash "$LAUNCH/pipeline.sh"       "$@" ;;
-    sim)      bash "$LAUNCH/sim_inference.sh"  "$@" ;;
-    real)     bash "$LAUNCH/real_inference.sh" "$@" ;;
-    debug)    bash "$LAUNCH/debug.sh"          "$@" ;;
+    pipeline)  bash "$LAUNCH/pipeline.sh"       "$@" ;;
+    sim)       bash "$LAUNCH/sim_inference.sh"  "$@" ;;
+    real)      bash "$LAUNCH/real_inference.sh" "$@" ;;
+    debug)     bash "$LAUNCH/debug.sh"          "$@" ;;
+    overnight) bash "$LAUNCH/overnight.sh"      "$@" ;;
     ""|-h|--help|help)
         echo "Usage: ./run.sh <mode> [args]"
         echo ""
@@ -31,6 +32,8 @@ case "$MODE" in
         echo "  pipeline --output-dir <dir> --finetune-only         Finetune Octo (diffusion head)"
         echo "  pipeline --output-dir <dir> --train-head-only       Train linear regression head"
         echo "  pipeline --output-dir <dir> --collect-and-train-head  Collect episodes + train linear head"
+        echo "  overnight                                            Unattended chain: train exp_11 + exp_12, each with holdout eval"
+        echo "           Launch: nohup ./run.sh overnight > debug/logs/overnight.log 2>&1 &"
         echo "           [--head-model-path hf://...]                 Backbone for linear head"
         echo "           [--head-batch-size N]                        Forward-pass batch size (default 32)"
         echo "           [--lam F]                                     Ridge regularisation (default 1e-4)"
