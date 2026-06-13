@@ -64,11 +64,18 @@ class OctoPolicy:
 
     def set_task_goal_image(self, goal_rgb: np.ndarray):
         """Condition the model on a goal image (HxWx3 RGB uint8)."""
-        goal = cv2.resize(goal_rgb, (IMAGE_SIZE, IMAGE_SIZE)).astype(np.uint8)
-        # create_tasks expects (batch, H, W, C) for goal images
-        self.task = self.model.create_tasks(
-            goals={"image_wrist": goal[None]}
-        )
+        # The goal must be supplied under the same image keys the model reads.
+        # This checkpoint feeds the wrist stream into the primary slot, so the
+        # goal image goes under image_primary at the primary resolution —
+        # putting it under image_wrist (the old code) lands it in a slot the
+        # model doesn't read, silently disabling goal conditioning.  image_wrist
+        # is only set when the checkpoint actually kept a wrist tokenizer.
+        primary = cv2.resize(goal_rgb, (self._primary_w, self._primary_h)).astype(np.uint8)
+        goals   = {"image_primary": primary[None]}   # (batch, H, W, C)
+        if self._has_wrist:
+            goals["image_wrist"] = cv2.resize(
+                goal_rgb, (IMAGE_SIZE, IMAGE_SIZE)).astype(np.uint8)[None]
+        self.task = self.model.create_tasks(goals=goals)
         print("[OCTO] Task (goal image) set.")
 
     def reset(self):

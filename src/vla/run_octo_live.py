@@ -167,6 +167,19 @@ def parse_args():
                     help="Consecutive sub-threshold grip predictions required to open. "
                          "Debounces diffusion sampling noise so a single low sample "
                          "cannot drop the object mid-transfer (default: 3)")
+    ap.add_argument("--phased", action="store_true",
+                    help="Phase-conditioned rollout for models trained with collect.py "
+                         "--phased. Starts on the 'pick' instruction, switches to "
+                         "'place' when the gripper commits closed, and to 'home' when "
+                         "it commits open again. The gripper transitions are the phase "
+                         "boundaries — no extra classifier needed.")
+    ap.add_argument("--phase-object", type=str, default="cube",
+                    help="Object name inserted into the phase instructions (default: cube).")
+    ap.add_argument("--phase-goal-dir", type=str, default=None,
+                    help="Directory with pick.png/place.png/home.png. When set, the "
+                         "phase switcher also swaps the goal image (for multimodal / "
+                         "goal-conditioned checkpoints). Without it, switching is "
+                         "language-only.")
     ap.add_argument("--zero-rotation", action="store_true",
                     help="Zero the rotation dims (drx/dry/drz) of every action before "
                          "sending. Use for yaw-symmetric objects (cube + suction "
@@ -223,7 +236,31 @@ def main():
             step         = args.step,
         )
 
-    if args.goal_image:
+    # Phase instructions mirror task.PHASE_INSTRUCTIONS — kept inline so the
+    # inference script has no Isaac/task import dependency.
+    PHASE_INSTRUCTIONS = {
+        "pick":  "pick up the {obj} from the pallet",
+        "place": "place the {obj} on the conveyor belt",
+        "home":  "return to the home position",
+    }
+
+    def apply_phase(phase: str):
+        """Condition the policy on a phase (text, plus goal image if available)."""
+        instr = PHASE_INSTRUCTIONS[phase].replace("{obj}", args.phase_object)
+        policy.set_task_text(instr)
+        if args.phase_goal_dir:
+            gp = Path(args.phase_goal_dir) / f"{phase}.png"
+            gimg = cv2.imread(str(gp))
+            if gimg is None:
+                print(f"[WARN] phase goal image not found: {gp} — text only this phase")
+            else:
+                policy.set_task_goal_image(cv2.cvtColor(gimg, cv2.COLOR_BGR2RGB))
+        print(f"[PHASE] → {phase}: '{instr}'")
+
+    if args.phased:
+        apply_phase("pick")
+
+    elif args.goal_image:
         goal_bgr = cv2.imread(args.goal_image)
         if goal_bgr is None:
             sys.exit(f"[ERR] Could not load goal image: {args.goal_image}")
@@ -298,6 +335,7 @@ def main():
         grip_hold_remaining = 0
         prev_grip           = 0.0
         low_grip_count      = 0
+        phase               = "pick"   # phased rollout: advances on gripper events
 
         if args.show_camera:
             cv2.namedWindow("Octo — camera feed", cv2.WINDOW_NORMAL)
@@ -374,6 +412,20 @@ def main():
                     grip_hold_remaining -= 1
                 else:
                     action[6] = raw_grip
+
+                # Phased rollout: the committed gripper transition is the phase
+                # boundary.  pick → place when it commits closed; place → home
+                # when it commits open again.  Switching changes the instruction
+                # (and goal image) so the next inferences solve the next phase.
+                if args.phased:
+                    if phase == "pick" and prev_grip < 0.5 and action[6] > 0.5:
+                        phase = "place"
+                        apply_phase(phase)
+                        policy.reset()   # clear history so place starts fresh
+                    elif phase == "place" and prev_grip > 0.5 and action[6] < 0.5:
+                        phase = "home"
+                        apply_phase(phase)
+                        policy.reset()
 
                 prev_grip = action[6]
                 sender.send(action)

@@ -50,6 +50,7 @@ class OctoFinetuner:
         checkpoint_dir:  Path,
         pretrained_path: str  = "hf://rail-berkeley/octo-base-1.5",
         finetune_mode:   str  = "head_mlp_only",
+        task_modality:   str  = "text_conditioned",
         n_steps:         int  = 50_000,
         batch_size:      int  = 32,
         overfit:         bool = False,
@@ -59,6 +60,7 @@ class OctoFinetuner:
         self.checkpoint_dir  = Path(checkpoint_dir)
         self.pretrained_path = pretrained_path
         self.finetune_mode   = finetune_mode
+        self.task_modality   = task_modality
         self.n_steps         = n_steps
         self.batch_size      = batch_size
         self.overfit         = overfit
@@ -85,7 +87,7 @@ class OctoFinetuner:
             "OOTF_OVERFIT": "1" if self.overfit else "0",
         }
         config      = Path(__file__).parent / "finetune_config.py"
-        config_str  = f"{self.finetune_mode},text_conditioned"
+        config_str  = f"{self.finetune_mode},{self.task_modality}"
         if self.overfit:
             config_str += ",overfit"
         cmd = [
@@ -106,7 +108,8 @@ class OctoFinetuner:
             "--config.viz_kwargs.trajs_for_viz=0",
         ]
         tag = "  OVERFIT" if self.overfit else ""
-        print(f"[FINETUNE] mode={self.finetune_mode}  steps={self.n_steps}{tag}")
+        print(f"[FINETUNE] mode={self.finetune_mode}  task={self.task_modality}  "
+              f"steps={self.n_steps}{tag}")
         subprocess.run(cmd, env=env, check=True)
         print(f"\n[FINETUNE] Done — checkpoint at {self.checkpoint_dir}")
 
@@ -126,6 +129,12 @@ def parse_args() -> Namespace:
     ap.add_argument("--pretrained-path",  default="hf://rail-berkeley/octo-base-1.5")
     ap.add_argument("--finetune-mode",    default="head_mlp_only",
                     choices=["full", "head_only", "head_mlp_only"])
+    ap.add_argument("--task-modality",    default="text_conditioned",
+                    choices=["text_conditioned", "image_conditioned", "multimodal"],
+                    help="How the goal is specified during training. "
+                         "text_conditioned: language only. image_conditioned: goal "
+                         "image via uniform relabeling. multimodal: both (keep_image_prob "
+                         "0.5) — model can be conditioned by text OR goal image at inference.")
     ap.add_argument("--n-finetune-steps", type=int, default=50_000)
     ap.add_argument("--batch-size",       type=int, default=32)
     ap.add_argument("--overfit",          action="store_true",
@@ -182,6 +191,7 @@ def main() -> None:
                 checkpoint_dir  = ckpt_dir,
                 pretrained_path = args.pretrained_path,
                 finetune_mode   = args.finetune_mode,
+                task_modality   = args.task_modality,
                 n_steps         = args.n_finetune_steps,
                 batch_size      = batch,
                 overfit         = args.overfit,

@@ -18,7 +18,8 @@ import numpy as np
 from scipy.spatial.transform import Rotation
 
 from task import (PickAndPlaceTask, SortingTask, Waypoint, _OBJ_PARAMS,
-                  WAYPOINT_NAMES, SORT_PLATFORM_CENTRES, SORT_PLATFORM_DIMS)
+                  WAYPOINT_NAMES, PHASE_INSTRUCTIONS,
+                  SORT_PLATFORM_CENTRES, SORT_PLATFORM_DIMS)
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -32,26 +33,58 @@ class EpisodeBuffer:
         self._images:   list = []
         self._actions:  list = []
         self._proprios: list = []
-        self._instr:    str  = ""
+        self._instrs:   list = []   # per-step instruction
+        self._phases:   list = []   # per-step phase label ("" when not phased)
 
     def add_step(self, image: np.ndarray, action: np.ndarray,
-                 proprio: np.ndarray, instruction: str):
+                 proprio: np.ndarray, instruction: str, phase: str = ""):
         """Append one simulation step."""
         self._images.append(image)
         self._actions.append(action.astype(np.float32))
         self._proprios.append(proprio.astype(np.float32))
-        self._instr = instruction
+        self._instrs.append(instruction)
+        self._phases.append(phase)
 
     def save(self, path: Path, rng_state: dict = None):
-        """Write frames to a compressed .npz file."""
+        """Write all frames to a single .npz file (one trajectory)."""
         np.savez_compressed(
             path,
             images      = np.stack(self._images,   axis=0),
             actions     = np.stack(self._actions,  axis=0),
             proprios    = np.stack(self._proprios, axis=0),
-            instruction = self._instr,
+            instruction = self._instrs[-1] if self._instrs else "",
             rng_state   = np.array([rng_state], dtype=object) if rng_state is not None else np.array([]),
         )
+
+    def save_phased(self, raw_dir: Path, ep_idx: int, rng_state: dict = None,
+                    min_len: int = 4) -> int:
+        """Split into contiguous same-phase segments and write each as its own
+        trajectory.  Each segment becomes an independent TFDS episode so Octo's
+        per-trajectory goal relabeling stays within a single phase.  Segments
+        shorter than min_len are dropped (too short to train a chunk). Returns
+        the number of files written."""
+        n = len(self._images)
+        written = 0
+        seg_start = 0
+        for i in range(1, n + 1):
+            if i == n or self._phases[i] != self._phases[seg_start]:
+                seg_len = i - seg_start
+                phase   = self._phases[seg_start]
+                if seg_len >= min_len:
+                    sl = slice(seg_start, i)
+                    path = raw_dir / f"episode_{ep_idx:06d}_{written:02d}_{phase}.npz"
+                    np.savez_compressed(
+                        path,
+                        images      = np.stack(self._images[sl],   axis=0),
+                        actions     = np.stack(self._actions[sl],  axis=0),
+                        proprios    = np.stack(self._proprios[sl], axis=0),
+                        instruction = self._instrs[seg_start],
+                        rng_state   = (np.array([rng_state], dtype=object)
+                                       if rng_state is not None else np.array([])),
+                    )
+                    written += 1
+                seg_start = i
+        return written
 
     def __len__(self):
         return len(self._images)
@@ -106,6 +139,7 @@ class DataCollector:
         action_stride:       int   = 1,
         fixed_yaw:           float = None,
         no_domain_rand:      bool  = False,
+        phased:              bool  = False,
     ):
         """Configure paths, episode count, and randomisation settings."""
         root = Path(__file__).parent.parent.parent
@@ -128,6 +162,7 @@ class DataCollector:
         self.action_stride       = max(1, int(action_stride))
         self.fixed_yaw           = fixed_yaw
         self.no_domain_rand      = no_domain_rand
+        self.phased              = phased
         self.raw_dir.mkdir(parents=True, exist_ok=True)
         import json as _json, datetime as _dt
         _meta_path = self.raw_dir.parent / "run_meta.json"
@@ -347,7 +382,14 @@ class DataCollector:
         pyramid = None   # SingleRigidPrim, created on first pyramid episode
 
         # ── Episode loop ──────────────────────────────────────────────────────
-        ep_idx = len(list(self.raw_dir.glob("*.npz")))
+        # Phased mode writes several files per episode (episode_<idx>_<seg>_<phase>);
+        # count distinct episode indices so resume is correct either way.
+        if self.phased:
+            ep_idx = len({p.stem.split("_")[1]
+                          for p in self.raw_dir.glob("episode_*_*.npz")
+                          if len(p.stem.split("_")) >= 3})
+        else:
+            ep_idx = len(list(self.raw_dir.glob("*.npz")))
         print(f"[COLLECT] target={self.n_episodes}  resuming from ep {ep_idx}", flush=True)
         consecutive_failures = 0
         MAX_FAILURES = 20
@@ -474,7 +516,18 @@ class DataCollector:
 
             n_wps = len(waypoints)
             _gripper_scan_done = False
+            # Phase latch for phased collection: pick (approaching, gripper open)
+            # → place (grasped, carrying) at the first close → home after release.
+            # The gripper transitions are exactly what the live loop can observe,
+            # so training phases and inference phase-switches line up.
+            _phase    = "pick"
+            _grasped  = False
             for wp_idx, wp in enumerate(waypoints, 1):
+                if wp.gripper > 0.5 and not _grasped:
+                    _grasped = True
+                    _phase   = "place"
+                elif wp.gripper < 0.5 and _grasped and _phase == "place":
+                    _phase   = "home"
                 _gripper_close_this_wp = False
                 if wp.gripper != _prev_gripper:
                     if wp.gripper > 0.5:
@@ -621,8 +674,14 @@ class DataCollector:
                             proprio_7d  = np.concatenate(
                                 [prev_pos, prev_euler, [prev_gripper]]
                             ).astype(np.float32)
+                            if self.phased:
+                                _step_instr = PHASE_INSTRUCTIONS[_phase].replace("{obj}", obj_type)
+                                _step_phase = _phase
+                            else:
+                                _step_instr = instruction
+                                _step_phase = ""
                             buf.add_step(prev_rgb, action.astype(np.float32),
-                                         proprio_7d, instruction)
+                                         proprio_7d, _step_instr, _step_phase)
                         prev_pos, prev_rot, prev_rgb = cur_pos, cur_rot.copy(), cur_rgb
                         prev_gripper = wp.gripper
                         _stride_count = 0
@@ -780,12 +839,18 @@ class DataCollector:
                 dims = (f"L={meta['L']:.2f} W={meta['W']:.2f} H={meta['H']:.2f}"
                         if meta else "")
                 tag = "[DRY-RUN]" if self.dry_run else "[COLLECT]"
+                _phase_tag = "  (phased)" if self.phased else ""
                 print(f"{tag} {ep_idx}/{self.n_episodes}  "
-                      f"steps={len(buf)}  obj={obj_type}  {dims}  '{instruction}'",
+                      f"steps={len(buf)}  obj={obj_type}  {dims}  '{instruction}'{_phase_tag}",
                       flush=True)
                 if not self.dry_run:
-                    buf.save(self.raw_dir / f"episode_{ep_idx - 1:06d}.npz",
-                             rng_state=_ep_rng_state)
+                    if self.phased:
+                        _nseg = buf.save_phased(self.raw_dir, ep_idx - 1,
+                                                rng_state=_ep_rng_state)
+                        print(f"[COLLECT]   wrote {_nseg} phase segment(s)", flush=True)
+                    else:
+                        buf.save(self.raw_dir / f"episode_{ep_idx - 1:06d}.npz",
+                                 rng_state=_ep_rng_state)
             else:
                 consecutive_failures += 1
                 if consecutive_failures >= MAX_FAILURES:
@@ -1005,6 +1070,12 @@ def parse_args():
                     help="Disable all domain randomization: fixed lighting, fixed object "
                          "colours, no Replicator steps. Use for overfit/debug runs where "
                          "every episode must look identical.")
+    ap.add_argument("--phased", action="store_true",
+                    help="Split each demo at the gripper transitions into separate "
+                         "pick/place/home trajectories, each saved as its own episode "
+                         "with its own phase instruction. Shortens the conditioning "
+                         "horizon and makes goal relabeling phase-local. Pairs with the "
+                         "--phased switcher in run_octo_live.py at inference.")
     ap.add_argument("--overfit", action="store_true",
                     help="Fully deterministic episodes for overfit/debug runs. Fixes ALL "
                          "per-episode sampling: forces cube object, fixed instruction, "
@@ -1079,6 +1150,7 @@ def main():
             fixed_yaw            = args.fixed_yaw,
             forced_obj_sequence  = args.forced_obj_sequence,
             no_domain_rand       = args.no_domain_rand,
+            phased               = args.phased,
         ).run()
     except Exception:
         print("\n[COLLECT] ── FATAL ERROR ──────────────────────────", flush=True)

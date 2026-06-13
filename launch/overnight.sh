@@ -1,52 +1,72 @@
 #!/bin/bash
 # =============================================================================
-# overnight.sh — unattended train + holdout-eval chain.
+# overnight.sh — phase-conditioned, maximally-varied dataset + dual training.
 #
-# Two sequential experiments, each: 200-episode collection → TFDS → 50k-step
-# full finetune → fresh-seed 10-episode holdout collection → open-loop
-# debug_policy report (checkpoint vs holdout).
+# Collects ONE varied dataset and trains TWO conditioning modalities on it:
 #
-#   Run 1  exp_11  fixed yaw 0.0          — safe baseline
-#   Run 2  exp_12  random yaw, folded EEF — tests symmetry-aware yaw folding
+#   data:    exp_15  — phased (pick/place/home split into separate trajectories),
+#                      all three objects, full pick/place ranges, domain
+#                      randomization on, random yaw (symmetry-folded target).
+#   exp_15   text_conditioned   — per-phase language (proven path, runs first)
+#   exp_16   multimodal         — per-phase language + goal image, shares exp_15 TFDS
 #
-# Holdout reports land in debug/policy_diagnosis/ named after data+checkpoint.
-# Launch:  nohup bash launch/overnight.sh > debug/logs/overnight.log 2>&1 &
+# Phase = trajectory means Octo's goal relabeling stays within a phase, giving
+# viewpoint-coherent subgoals from the wrist camera.  At inference, run with
+# --phased: the gripper transitions switch pick → place → home.
+#
+# Launch:  nohup ./run.sh overnight > debug/logs/overnight.log 2>&1 &
 # =============================================================================
 
 cd "$(dirname "$0")/.." || exit 1
 
+DATA=data/exp_15
+HOLDOUT_DIR=data/exp_15_holdout
+HOLDOUT=$HOLDOUT_DIR/raw
+STEPS=50000
+
+# Max-variety collection: all objects, default (full) ranges, domain rand on,
+# random yaw (folded per object symmetry in task.py), phased segmentation.
+COLLECT_ARGS=(--phased --forced-obj-sequence cube cylinder pyramid)
+
 echo "=== overnight.sh started: $(date) ==="
 
-# ── Run 1: exp_11 — fixed yaw (safe baseline) ────────────────────────────────
-./run.sh pipeline --output-dir data/exp_11 --n-episodes 200 \
-    --forced-obj-sequence cube --fixed-yaw 0.0 \
-    --finetune-mode full --n-finetune-steps 50000
+# ── 1. Collect + convert the varied phased training set ──────────────────────
+if [ "$(ls "$DATA"/raw/*.npz 2>/dev/null | wc -l)" -lt 100 ]; then
+    echo "--- collect exp_15 (phased, varied)  ($(date)) ---"
+    ./run.sh pipeline --output-dir "$DATA" --collect-only --n-episodes 200 "${COLLECT_ARGS[@]}"
+fi
+./run.sh pipeline --output-dir "$DATA" --convert-only
 
-./run.sh pipeline --output-dir data/exp_11_holdout --collect-only \
-    --n-episodes 10 --forced-obj-sequence cube --fixed-yaw 0.0 --seed 999
-
-CKPT_11=$(ls -d data/exp_11/checkpoint/octo_finetune/experiment_* 2>/dev/null | tail -1)
-if [ -n "$CKPT_11" ]; then
-    ./run.sh debug policy --checkpoint "$CKPT_11" \
-        --raw-dir data/exp_11_holdout/raw --n-episodes 10
-else
-    echo "WARN: no exp_11 checkpoint found — skipping holdout eval"
+# ── 2. Phased holdout for open-loop eval ─────────────────────────────────────
+if [ "$(ls "$HOLDOUT"/*.npz 2>/dev/null | wc -l)" -lt 50 ]; then
+    echo "--- collect exp_15 holdout (phased, varied)  ($(date)) ---"
+    ./run.sh pipeline --output-dir "$HOLDOUT_DIR" --collect-only \
+        --n-episodes 50 --seed 777 "${COLLECT_ARGS[@]}"
 fi
 
-# ── Run 2: exp_12 — random yaw with symmetry-folded EEF target ───────────────
-./run.sh pipeline --output-dir data/exp_12 --n-episodes 200 \
-    --forced-obj-sequence cube \
-    --finetune-mode full --n-finetune-steps 50000
+eval_ckpt() {
+    local name=$1
+    local ckpt
+    ckpt=$(ls -d "data/$name"/checkpoint/octo_finetune/experiment_* 2>/dev/null | tail -1)
+    if [ -n "$ckpt" ]; then
+        ./run.sh debug policy --checkpoint "$ckpt" --raw-dir "$HOLDOUT" --n-episodes 50
+    else
+        echo "WARN: no $name checkpoint — skipping eval"
+    fi
+}
 
-./run.sh pipeline --output-dir data/exp_12_holdout --collect-only \
-    --n-episodes 10 --forced-obj-sequence cube --seed 998
+# ── 3. Train text_conditioned (per-phase language) — runs first ──────────────
+echo "--- train exp_15 : text_conditioned  ($(date)) ---"
+./run.sh pipeline --output-dir "$DATA" --finetune-only \
+    --task-modality text_conditioned --finetune-mode full --n-finetune-steps "$STEPS"
+eval_ckpt exp_15
 
-CKPT_12=$(ls -d data/exp_12/checkpoint/octo_finetune/experiment_* 2>/dev/null | tail -1)
-if [ -n "$CKPT_12" ]; then
-    ./run.sh debug policy --checkpoint "$CKPT_12" \
-        --raw-dir data/exp_12_holdout/raw --n-episodes 10
-else
-    echo "WARN: no exp_12 checkpoint found — skipping holdout eval"
-fi
+# ── 4. Train multimodal (per-phase language + goal image), shares exp_15 TFDS ─
+echo "--- train exp_16 : multimodal  ($(date)) ---"
+mkdir -p data/exp_16
+ln -sfn ../exp_15/tfds data/exp_16/tfds
+./run.sh pipeline --output-dir data/exp_16 --finetune-only \
+    --task-modality multimodal --finetune-mode full --n-finetune-steps "$STEPS"
+eval_ckpt exp_16
 
 echo "=== overnight.sh done: $(date) ==="

@@ -186,6 +186,18 @@ def _trajectory_safe(waypoints: List[Waypoint]) -> bool:
     return True
 
 
+# Phase-conditioned training: each pick-and-place demo is split at the gripper
+# transitions into three sub-trajectories, each trained as its own short-horizon
+# task with its own instruction.  {obj} is filled with the object type.
+# The gripper close/open events are the phase boundaries — observable at
+# inference, so the live loop can switch instruction (and goal image) on them.
+PHASE_INSTRUCTIONS = {
+    "pick":  "pick up the {obj} from the pallet",
+    "place": "place the {obj} on the conveyor belt",
+    "home":  "return to the home position",
+}
+
+
 # Semantic labels for the 12-waypoint trajectory — used by debug tooling.
 WAYPOINT_NAMES = [
     "Center Above Pick",    # arm moves XY to directly above object at high Z
