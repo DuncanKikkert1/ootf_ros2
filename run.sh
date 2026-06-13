@@ -54,6 +54,7 @@ case "$MODE" in
         echo "  debug collect [--seq seq1-seq4] [--seed N]          Dry-run episode collector"
         echo "  debug policy [--n-episodes N] [--pretrained]        Diagnose policy vs ground truth (image → action)"
         echo "  debug replay [--npz <episode.npz>]                  Replay GT actions through the sim (action → motion)"
+        echo "  debug success [--attempts N] [--phased]             Closed-loop success rate over N resets"
         exit 0
         ;;
     *)

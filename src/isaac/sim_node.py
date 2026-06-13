@@ -247,6 +247,7 @@ class RobotROSNode(Node):
         self.camera_publisher     = self.create_publisher(Image,             '/mecheye/color',   1)
         self.gripper_publisher    = self.create_publisher(String,            '/gripper_status',  1)
         self.eef_state_publisher  = self.create_publisher(Float64MultiArray, '/eef_state',      10)
+        self.cube_pose_publisher  = self.create_publisher(Float64MultiArray, '/cube_pose',      10)
         self.get_logger().info("ROS2 node ready")
 
     def _joint_cb(self, msg: JointState) -> None:
@@ -538,6 +539,14 @@ while simulation_app.is_running():
         world_quat_wxyz=np.array([_sync_l6_xyzw[3], _sync_l6_xyzw[0],
                                    _sync_l6_xyzw[1], _sync_l6_xyzw[2]]),
     )
+
+    # Publish the pickup cube's world pose every loop so an external success-rate
+    # harness can detect grasp (lift) and place (final position) without scraping logs.
+    if _pickup_cube is not None:
+        _cp_now, _ = _pickup_cube.get_world_pose()
+        _cp_msg = Float64MultiArray()
+        _cp_msg.data = [float(_cp_now[0]), float(_cp_now[1]), float(_cp_now[2])]
+        ros_node.cube_pose_publisher.publish(_cp_msg)
 
     # Cube-watch: report the exact frame the pickup cube first leaves its rest
     # position, with the EEF geometry and gripper state at that moment.  This

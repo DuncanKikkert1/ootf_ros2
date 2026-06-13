@@ -112,6 +112,26 @@ print(os.path.join(os.path.dirname(isaacsim.__file__), 'exts', 'isaacsim.ros2.br
         python3 "$PROJECT_ROOT/debug/debug_replay.py" "$@" 2>&1 | tee "$LOG"
         ;;
 
+    success)
+        # ── Closed-loop success-rate harness (requires sim + jax/octo) ────────
+        OCTO_PY=""
+        for py in $(find ~/.pyenv/versions -name "python3" 2>/dev/null | sort -r) "$(which python3 2>/dev/null)"; do
+            "$py" -c "import jax; import octo" 2>/dev/null && OCTO_PY="$py" && break
+        done
+        [ -z "$OCTO_PY" ] && { echo "ERROR: No Python with jax + octo found."; exit 1; }
+
+        source "/opt/ros/$ROS_DISTRO/setup.bash"
+        export ROS_DISTRO
+        export RMW_IMPLEMENTATION=rmw_fastrtps_cpp
+
+        mkdir -p "$LOG_DIR/success"
+        LOG="$LOG_DIR/success/success_${TIMESTAMP}.log"
+        echo "Running success-rate harness  (ROS_DISTRO=$ROS_DISTRO)"
+        echo "Logging to $LOG"
+        shift   # drop "success" so remaining args pass through
+        "$OCTO_PY" "$PROJECT_ROOT/debug/success_rate.py" "$@" 2>&1 | tee "$LOG"
+        ;;
+
     collect)
         # ── Dry-run episode collector (no files written) ─────────────────────
         ISAAC_PY=""
@@ -144,7 +164,7 @@ print(os.path.join(os.path.dirname(isaacsim.__file__), 'exts', 'isaacsim.ros2.br
 
     *)
         echo "ERROR: Unknown component '$COMPONENT'."
-        echo "Usage: bash launch/debug.sh [sim|bridge|joint|collect|policy|replay|gripper-test]"
+        echo "Usage: bash launch/debug.sh [sim|bridge|joint|collect|policy|replay|success|gripper-test]"
         exit 1
         ;;
 esac
