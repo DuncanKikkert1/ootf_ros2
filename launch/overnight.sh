@@ -24,7 +24,7 @@
 cd "$(dirname "$0")/.." || exit 1
 
 STEPS=50000
-COLLECT_ARGS=(--phased --forced-obj-sequence cube cylinder pyramid)
+COLLECT_ARGS=(--phased --forced-obj-sequence cube)
 
 # Python with numpy for the (non-Isaac) derivation step.
 PYNP=""

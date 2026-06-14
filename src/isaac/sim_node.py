@@ -58,7 +58,7 @@ GRIP_SETTLE_QD   = 0.05  # rad/s — fire gripper.close() only below this joint 
 # default pick ranges to their midpoints (0.925, 0.25); z = surface_z + hh.
 PICKUP_PRIM_PATH    = "/World/pick_cube"
 PICKUP_POSITION     = [0.925, 0.25, 0.48]   # nominal pick centre
-PICKUP_XY_VARIATION = 0.00   # m — set >0 to add XY jitter; 0.0 for overfit/debug runs
+PICKUP_XY_VARIATION = 0.10   # m — set >0 to add XY jitter; 0.0 for overfit/debug runs
 PICKUP_ORIENT_WXYZ  = [1.0, 0.0, 0.0, 0.0]   # identity — no rotation
 CUBE_HEIGHT         = 0.10   # m — must match _OBJ_PARAMS['cube']['height'] in task.py
 CUBE_MASS           = 0.20   # kg
@@ -501,6 +501,22 @@ while simulation_app.is_running():
 
     if ros_node.do_reset:
         ros_node.do_reset = False
+
+        # Full reset so every success-rate attempt starts from a known state,
+        # regardless of how the previous rollout ended (the policy does NOT
+        # reliably return home when it fails).  Home the arm, open the gripper,
+        # clear the command chain, and drop any pending eef_delta.
+        _gripper_state  = False
+        gripper.open()
+        _joint_substeps = None
+        _ik_fail_streak = 0
+        _q_cmd_prev     = np.array(HOME_POSITION, dtype=float)
+        ros_node.eef_delta = None
+        robot.get_articulation_controller().apply_action(
+            ArticulationAction(joint_positions=HOME_POSITION,
+                               joint_velocities=np.zeros(robot.num_dof))
+        )
+
         if _pickup_cube is not None:
             _rx = PICKUP_POSITION[0] + np.random.uniform(-PICKUP_XY_VARIATION, PICKUP_XY_VARIATION)
             _ry = PICKUP_POSITION[1] + np.random.uniform(-PICKUP_XY_VARIATION, PICKUP_XY_VARIATION)
@@ -513,7 +529,7 @@ while simulation_app.is_running():
             _pickup_cube.set_angular_velocity(np.zeros(3))
             _cube_watch_home = _reset_pos.copy()
             _cube_alarmed    = False
-            print(f"[SCENE] Cube reset to {_reset_pos.round(4)}")
+            print(f"[SCENE] Reset: arm→home, gripper→open, cube→{_reset_pos.round(4)}")
         else:
             print(f"[SCENE] Reset requested but cube prim not found — "
                   f"set PICKUP_PRIM_PATH in sim_node.py")

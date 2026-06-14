@@ -62,7 +62,7 @@ def parse_args():
     ap.add_argument("--ros2-topic",  default="/mecheye/color")
     ap.add_argument("--sync-frames", type=int, default=12)
     ap.add_argument("--step-delay",  type=float, default=0.2)
-    ap.add_argument("--reset-settle", type=float, default=2.0, help="Seconds to let the cube settle after reset")
+    ap.add_argument("--reset-settle", type=float, default=3.5, help="Seconds for the arm to home + cube to settle after reset")
     # task spec
     ap.add_argument("--phased",       action="store_true")
     ap.add_argument("--phase-object", default="cube")
@@ -146,6 +146,8 @@ def main():
 
             phase = "pick"; prev_grip = 0.0; grip_hold = 0; low_grip = 0
             cube_lift = 0.0
+            grip_fired = False        # did the gripper ever commit closed?
+            min_xy = float("inf")     # closest the EEF got to the cube in XY (proxy)
 
             for step in range(1, args.max_steps + 1):
                 frame = camera.capture_rgb()
@@ -174,11 +176,19 @@ def main():
                     elif phase == "place" and prev_grip > 0.5 and action[6] < 0.5:
                         phase = "home"; apply_phase(phase); policy.reset()
 
+                if action[6] > 0.5:
+                    grip_fired = True
                 prev_grip = action[6]
                 delta_pub.publish(Float64MultiArray(data=[float(v) for v in action]))
 
                 if cube["v"] is not None:
                     cube_lift = max(cube_lift, cube["v"][2] - cube_start[2])
+                    # eef_state proprio xy ≈ EEF in robot frame; cube_pose is world.
+                    # Not the same frame, but the per-attempt MINIMUM is still a
+                    # useful relative proxy for "did it get close in XY".
+                    if eefst["v"] is not None:
+                        min_xy = min(min_xy, float(np.linalg.norm(
+                            eefst["v"][:2] - cube["v"][:2])))
 
                 if args.sync_frames > 0:
                     wait_frames(args.sync_frames)
@@ -190,7 +200,8 @@ def main():
             placed  = (cp is not None and cp[1] < args.belt_y_max and cp[2] > args.floor_z_min)
             results.append((grasped, placed))
             print(f"[RESULT] grasped={grasped}  placed={placed}  "
-                  f"max_lift={cube_lift*1000:.0f}mm  cube_end={cp.round(3)}")
+                  f"grip_fired={grip_fired}  max_lift={cube_lift*1000:.0f}mm  "
+                  f"min_xy={min_xy*1000:.0f}mm  cube_end={cp.round(3)}")
 
         g = sum(1 for gr, _ in results if gr)
         p = sum(1 for _, pl in results if pl)

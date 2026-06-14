@@ -114,22 +114,48 @@ print(os.path.join(os.path.dirname(isaacsim.__file__), 'exts', 'isaacsim.ros2.br
 
     success)
         # ── Closed-loop success-rate harness (requires sim + jax/octo) ────────
+        # rclpy must come from the Isaac bridge (built for the pyenv jax/octo
+        # interpreter), NOT /opt/ros (built for the system python) — same setup
+        # as sim_inference.sh, otherwise rclpy's C extension import fails.
+        ISAAC_PY=""
+        for py in $(find ~/.pyenv/versions -name "python3" 2>/dev/null | sort -r) "$(which python3 2>/dev/null)"; do
+            "$py" -c "import isaacsim" 2>/dev/null && ISAAC_PY="$py" && break
+        done
+        [ -z "$ISAAC_PY" ] && { echo "ERROR: No Python with isaacsim found."; exit 1; }
+
         OCTO_PY=""
         for py in $(find ~/.pyenv/versions -name "python3" 2>/dev/null | sort -r) "$(which python3 2>/dev/null)"; do
             "$py" -c "import jax; import octo" 2>/dev/null && OCTO_PY="$py" && break
         done
         [ -z "$OCTO_PY" ] && { echo "ERROR: No Python with jax + octo found."; exit 1; }
 
-        source "/opt/ros/$ROS_DISTRO/setup.bash"
+        ISAAC_BRIDGE=$("$ISAAC_PY" -c "
+import os, isaacsim
+print(os.path.join(os.path.dirname(isaacsim.__file__), 'exts', 'isaacsim.ros2.bridge', '$ROS_DISTRO'))
+" 2>/dev/null)
+
+        if [ -z "$ISAAC_WS" ]; then
+            for candidate in "$HOME/IsaacSim-ros_workspaces" "$HOME/isaac_ros_ws" "/opt/IsaacSim-ros_workspaces"; do
+                [ -d "$candidate/build_ws/$ROS_DISTRO" ] && ISAAC_WS="$candidate" && break
+            done
+            [ -z "$ISAAC_WS" ] && { echo "ERROR: Isaac Sim ROS workspace not found. Set ISAAC_WS=/path."; exit 1; }
+        fi
+
+        source "$ISAAC_WS/build_ws/$ROS_DISTRO/${ROS_DISTRO}_ws/install/local_setup.bash"
+        source "$ISAAC_WS/build_ws/$ROS_DISTRO/isaac_sim_ros_ws/install/local_setup.bash"
         export ROS_DISTRO
         export RMW_IMPLEMENTATION=rmw_fastrtps_cpp
+        export LD_LIBRARY_PATH="$ISAAC_BRIDGE/lib:$LD_LIBRARY_PATH"
+        export PYTHONPATH="$ISAAC_BRIDGE/rclpy:$PROJECT_ROOT/src/comm:$PYTHONPATH"
 
         mkdir -p "$LOG_DIR/success"
         LOG="$LOG_DIR/success/success_${TIMESTAMP}.log"
         echo "Running success-rate harness  (ROS_DISTRO=$ROS_DISTRO)"
+        echo "Using Octo : $OCTO_PY"
         echo "Logging to $LOG"
         shift   # drop "success" so remaining args pass through
-        "$OCTO_PY" "$PROJECT_ROOT/debug/success_rate.py" "$@" 2>&1 | tee "$LOG"
+        export PYTHONUNBUFFERED=1   # stream progress to the log instead of buffering
+        XLA_PYTHON_CLIENT_PREALLOCATE=false "$OCTO_PY" "$PROJECT_ROOT/debug/success_rate.py" "$@" 2>&1 | tee "$LOG"
         ;;
 
     collect)
