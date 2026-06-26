@@ -6,6 +6,8 @@
 #   overfit (optional): disables augmentation, shrinks batch/intervals/warmup,
 #                       zeros weight decay — use for initial end-to-end debugging.
 
+import os
+
 from ml_collections import ConfigDict
 from ml_collections.config_dict import FieldReference, placeholder
 
@@ -20,6 +22,17 @@ def get_config(config_string: str = "head_mlp_only,text_conditioned") -> ConfigD
     assert task in ["image_conditioned", "text_conditioned", "multimodal"]
     assert mode in ["full", "head_only", "head_mlp_only"]
 
+    # ── PROPRIO toggle ───────────────────────────────────────────────────────
+    # Default is set here; an env var OOTF_PROPRIO=1/0 OVERRIDES it per-run, so
+    # you can train a with-proprio and a no-proprio model on the SAME data
+    # without editing this file (e.g. OOTF_PROPRIO=1 ./run.sh … --finetune-only).
+    # With proprio the model can predict the action from its own arm pose and
+    # under-use the cube (goes to the mean pose → ~100 mm overshoot); without it
+    # (image+language only, like bridge Octo) it must servo on the magenta cube.
+    _PROPRIO_DEFAULT = True    # proprio ON (the no-proprio run flailed + rammed; proprio is needed)
+    _PROPRIO = {"1": True, "0": False}.get(
+        os.environ.get("OOTF_PROPRIO", ""), _PROPRIO_DEFAULT)
+
     FINETUNING_KWARGS = {
         "name": "ootf_synthetic",
         "data_dir": placeholder(str),
@@ -28,7 +41,9 @@ def get_config(config_string: str = "head_mlp_only,text_conditioned") -> ConfigD
         # (two different random crops of the same frame) while inference feeds
         # identical resized frames, creating a train/eval mismatch.
         "image_obs_keys": {"primary": "image_wrist"},
-        "proprio_obs_key": "proprio",
+        # Proprio on/off via _PROPRIO (default + OOTF_PROPRIO env override above).
+        # The proprio observation tokenizer below follows this automatically.
+        "proprio_obs_key": "proprio" if _PROPRIO else None,
         "language_key": "language_instruction",
         "action_proprio_normalization_type": "normal",
         # Don't normalize the gripper dimension (index 6)
@@ -151,6 +166,8 @@ def get_config(config_string: str = "head_mlp_only,text_conditioned") -> ConfigD
     # Without this, it stays in the model, wastes parameters, and logs a warning
     # every step. finetune.py uses config_delete_keys to drop entries before
     # building the model.
+    # Keep the pretrained DiffusionActionHead (exp_16 — the run that actually got
+    # 2/10 — used diffusion; the L1 head regressed to deterministic-to-the-mean).
     config["config_delete_keys"] = {
         "model": {"observation_tokenizers": {"wrist": True}}
     }
@@ -159,17 +176,23 @@ def get_config(config_string: str = "head_mlp_only,text_conditioned") -> ConfigD
     # bin_type="normal" uses Gaussian quantile bins, correct for z-scored inputs.
     # Octo's finetune.py deep-merges update_config into the pretrained model config
     # so the new tokenizer is added without touching the pretrained weights.
+    # Keep the pretrained DiffusionActionHead (no head override) — only add the
+    # proprio tokenizer below when proprio is enabled.
     config["update_config"] = {
         "model": {
-            "observation_tokenizers": {
-                "proprio": {
-                    "module": "octo.model.components.tokenizers",
-                    "name": "LowdimObsTokenizer",
-                    "args": [],
-                    "kwargs": {"n_bins": 256, "bin_type": "normal", "obs_keys": ("proprio",)},
-                }
-            }
+            "observation_tokenizers": {},
         }
     }
+
+    # Proprio tokenizer is injected ONLY when proprio is enabled (PROPRIO TOGGLE
+    # above), so toggling that one line turns proprio fully on/off — data key and
+    # model tokenizer stay in sync.  LowdimObsTokenizer over the z-scored 7D proprio.
+    if FINETUNING_KWARGS["proprio_obs_key"] is not None:
+        config["update_config"]["model"]["observation_tokenizers"]["proprio"] = {
+            "module": "octo.model.components.tokenizers",
+            "name": "LowdimObsTokenizer",
+            "args": [],
+            "kwargs": {"n_bins": 256, "bin_type": "normal", "obs_keys": ("proprio",)},
+        }
 
     return ConfigDict(config)

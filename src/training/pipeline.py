@@ -127,8 +127,11 @@ def parse_args() -> Namespace:
     ap.add_argument("--output-dir",       required=True,
                     help="Root output dir (tfds/ and checkpoint/ created inside)")
     ap.add_argument("--pretrained-path",  default="hf://rail-berkeley/octo-base-1.5")
-    ap.add_argument("--finetune-mode",    default="head_mlp_only",
-                    choices=["full", "head_only", "head_mlp_only"])
+    ap.add_argument("--finetune-mode",    default="full",
+                    choices=["full", "head_only", "head_mlp_only"],
+                    help="Which weights to train. 'full' (default) is what the "
+                         "real runs use; head_only / head_mlp_only freeze the "
+                         "transformer for quick probing.")
     ap.add_argument("--task-modality",    default="text_conditioned",
                     choices=["text_conditioned", "image_conditioned", "multimodal"],
                     help="How the goal is specified during training. "
