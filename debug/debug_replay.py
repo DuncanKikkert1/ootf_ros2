@@ -64,6 +64,13 @@ def parse_args():
                          "instead of frame counting (legacy behaviour; not recommended)")
     ap.add_argument("--no-reset", action="store_true",
                     help="Skip homing the arm and resetting the scene before replay")
+    ap.add_argument("--grasp-test", action="store_true",
+                    help="GROUND-TRUTH grasp test: replay once to find the cup's world "
+                         "position at the grasp pose, place the cube exactly there, then "
+                         "replay again and report whether the suction actually latches. "
+                         "Answers 'can the controller+sim grasp with perfect actions?'")
+    ap.add_argument("--pallet-z", type=float, default=0.48,
+                    help="Cube-centre rest height on the pallet (grasp-test).")
     return ap.parse_args()
 
 
@@ -84,23 +91,33 @@ def main():
     import rclpy
     from rclpy.node import Node
     from sensor_msgs.msg import JointState
-    from std_msgs.msg import Empty, Float64MultiArray
+    from std_msgs.msg import Empty, Float64MultiArray, String
 
     rclpy.init()
     node       = rclpy.create_node("gt_replay")
     delta_pub  = node.create_publisher(Float64MultiArray, "/eef_delta",    10)
     joint_pub  = node.create_publisher(JointState,        "/joint_command", 10)
     reset_pub  = node.create_publisher(Empty,             "/reset_scene",    1)
+    setcube_pub = node.create_publisher(Float64MultiArray, "/set_cube_pose", 1)
     # /eef_state is published once per sim render frame, so counting messages
     # counts sim frames — the only pacing that stays correct when the sim runs
     # slower than real time.
     eef = {"v": None, "frames": 0}
+    align = {"cup": None}                 # cup centroid world XYZ from /grasp_align
+    cube  = {"v": None}                   # cube world XYZ from /cube_pose
+    latched = {"v": False}                # pick_cube in /gripper_status
 
     def _eef_cb(m):
         eef["v"]       = np.array(m.data[:7])
         eef["frames"] += 1
 
     node.create_subscription(Float64MultiArray, "/eef_state", _eef_cb, 10)
+    node.create_subscription(Float64MultiArray, "/grasp_align",
+                             lambda m: align.update(cup=(np.array(m.data[3:6]) if len(m.data) >= 6 else None)), 10)
+    node.create_subscription(Float64MultiArray, "/cube_pose",
+                             lambda m: cube.update(v=np.array(m.data[:3])), 10)
+    node.create_subscription(String, "/gripper_status",
+                             lambda m: latched.update(v=("pick_cube" in m.data)), 10)
 
     def spin(seconds: float):
         end = time.time() + seconds
@@ -122,6 +139,64 @@ def main():
         print("[REPLAY] Waiting for /eef_state from sim_node …")
         while eef["v"] is None:
             rclpy.spin_once(node, timeout_sec=0.1)
+
+        if args.grasp_test:
+            def home(reset_cube):
+                jm = JointState(); jm.position = list(HOME_POSITION)
+                joint_pub.publish(jm); spin(2.5)
+                if reset_cube:
+                    reset_pub.publish(Empty()); spin(1.5)
+
+            def replay():
+                for k in range(len(actions)):
+                    m = Float64MultiArray(); m.data = [float(v) for v in actions[k]]
+                    delta_pub.publish(m); wait_frames(args.frames_per_step)
+
+            # PASS 1: reach the grasp pose, read where the suction cup ends up.
+            print("[GRASP-TEST] Pass 1: replaying to find the grasp-pose cup position …")
+            home(reset_cube=True)
+            replay(); spin(0.5)
+            cup = align["cup"]
+            if cup is None:
+                sys.exit("[ERR] No /grasp_align received — restart the sim (it must "
+                         "publish the cup XYZ).")
+            target = [float(cup[0]), float(cup[1]), float(args.pallet_z)]
+            print(f"[GRASP-TEST] Cup ended at world {np.round(cup,3)} → "
+                  f"placing cube at {np.round(target,3)}")
+
+            # Place the cube exactly under the grasp pose, then re-home WITHOUT a
+            # scene reset (so the cube stays put) and replay again.
+            setcube_pub.publish(Float64MultiArray(data=target)); spin(1.0)
+            print("[GRASP-TEST] Pass 2: re-homing (cube stays) + replaying the same actions …")
+            home(reset_cube=False)
+            cube_before = cube["v"].copy() if cube["v"] is not None else np.array(target)
+            replay()
+            for _ in range(20):     # hold closed so the suction can settle + latch
+                delta_pub.publish(Float64MultiArray(data=[0, 0, 0, 0, 0, 0, 1.0]))
+                wait_frames(args.frames_per_step)
+            spin(0.5)
+
+            cube_after = cube["v"]
+            lift = float(cube_after[2] - cube_before[2]) if cube_after is not None else 0.0
+            cf   = align["cup"]
+            dxy  = (float(np.linalg.norm(cf[:2] - cube_after[:2]))
+                    if cf is not None and cube_after is not None else float("nan"))
+            print("\n── GROUND-TRUTH GRASP TEST ─────────────────────────────────")
+            print(f"cube placed at        : {np.round(target,3)}")
+            print(f"cube after grasp+hold : "
+                  f"{np.round(cube_after,3) if cube_after is not None else None}")
+            print(f"cup↔cube XY at end    : {dxy*1000:.0f} mm")
+            print(f"cube lift during hold : {lift*1000:+.0f} mm")
+            print(f"suction latched (pick_cube held): {latched['v']}")
+            if latched["v"]:
+                print("→ GRASP SUCCEEDED with ground-truth actions: the controller + sim "
+                      "CAN grasp. So rollout failures are MODEL-side (it outputs wrong "
+                      "actions), not the controller/sim.")
+            else:
+                print("→ GRASP FAILED even with perfect actions + the cube placed exactly "
+                      "under the grasp pose: the controller/sim/gripper itself can't "
+                      "execute the grasp — that must be fixed before any model can work.")
+            return
 
         if not args.no_reset:
             print("[REPLAY] Homing arm + resetting scene …")

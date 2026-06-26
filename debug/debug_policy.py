@@ -242,8 +242,11 @@ def make_plot(gt: np.ndarray, pred: np.ndarray, out_path: Path, n_episodes: int,
 def parse_args():
     """Parse CLI arguments for checkpoint, data directory, and evaluation settings."""
     ap = argparse.ArgumentParser(description="Visualize Octo policy predictions vs ground truth.")
-    ap.add_argument("--checkpoint",   type=str, default=None,
-                    help="Path to an octo_finetune experiment dir (default: latest)")
+    ap.add_argument("--model-path", "--checkpoint", type=str, default=None,
+                    dest="checkpoint",
+                    help="Path to an octo_finetune experiment dir (default: latest). "
+                         "(--checkpoint is an alias, matching run_octo_live's "
+                         "--model-path.)")
     ap.add_argument("--step",         type=int, default=None,
                     help="Checkpoint step to load (default: latest)")
     ap.add_argument("--dataset-name", type=str, default="ootf_synthetic",
