@@ -49,7 +49,10 @@ PID_BRIDGE=$!
 python3 "$PROJECT_ROOT/src/vla/joint_service_client.py" &
 PID_JOINT=$!
 
-"$OCTO_PY" "$PROJECT_ROOT/src/vla/run_octo_live.py" "$@" &
+# --temporal-ensemble: real-robot inference smooths the action chunks (this used
+# to be run_octo_live's default; the default is now OFF to match the sim harness,
+# so it is requested explicitly here). Override with flags after "$@".
+"$OCTO_PY" "$PROJECT_ROOT/src/vla/run_octo_live.py" --temporal-ensemble "$@" &
 PID_OCTO=$!
 
 trap "echo ''; echo 'Shutting down...'; kill $PID_BRIDGE $PID_JOINT $PID_OCTO 2>/dev/null; wait $PID_BRIDGE $PID_JOINT $PID_OCTO 2>/dev/null" INT TERM

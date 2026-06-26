@@ -151,12 +151,16 @@ def parse_args():
                     help="Run without a camera (sends random noise images for testing Octo + TCP)")
     ap.add_argument("--action-horizon", type=int, default=4,
                     help="Number of actions per predicted chunk — must match training config (default: 4)")
-    ap.add_argument("--ensemble-weight", type=float, default=0.0,
-                    help="Exponential decay weight for temporal ensembling. "
-                         "0 = uniform average across overlapping predictions (default: 0)")
-    ap.add_argument("--no-temporal-ensemble", action="store_true",
-                    help="Use only chunk[0] without averaging overlapping predictions. "
-                         "Use this for debugging to see raw model output.")
+    ap.add_argument("--temporal-ensemble", action="store_true",
+                    help="ACT-style temporal ensembling: average the overlapping "
+                         "predictions for the current step instead of using raw "
+                         "chunk[0]. OFF by default (raw output); same convention "
+                         "and default as debug/success_rate.py.")
+    ap.add_argument("--ensemble-decay", "--ensemble-weight", type=float,
+                    default=0.0, dest="ensemble_decay",
+                    help="Exponential decay weight for --temporal-ensemble: "
+                         "w=exp(-decay*age). 0 = uniform average (default: 0). "
+                         "(--ensemble-weight is a deprecated alias.)")
     ap.add_argument("--grip-threshold", type=float, default=0.9,
                     help="Ensemble grip value must exceed this before closing the gripper. "
                          "Higher values prevent premature closes during approach (default: 0.9)")
@@ -187,10 +191,10 @@ def parse_args():
                          "target is unobservable from images (90-degree symmetry), so "
                          "the rotation head outputs multimodal noise that spins the "
                          "wrist camera and derails position servoing.")
-    ap.add_argument("--grip-hold-steps", type=int, default=3,
+    ap.add_argument("--grip-hold-steps", type=int, default=20,
                     help="Once the gripper closes, hold it closed for at least this many "
                          "steps regardless of model output. Gives the surface gripper time "
-                         "to latch before the model commands open (default: 10 = 2 s at 5 Hz)")
+                         "to latch before the model commands open (default: 20 = 4 s at 5 Hz)")
     ap.add_argument("--head-path", type=str, default=None,
                     help="Path to a trained linear_head.npz — uses LinearHeadPolicy "
                          "instead of the diffusion head (recommended)")
@@ -363,7 +367,7 @@ def main():
                 proprio = eef_state_sub.get_latest() if eef_state_sub is not None else None
                 chunk = policy.step(frame_rgb, proprio=proprio)   # (action_horizon, 7)
 
-                if args.no_temporal_ensemble:
+                if not args.temporal_ensemble:
                     # Use only the first action in the chunk — each action represents
                     # one full action_stride window (0.2 s at stride=12).  Executing
                     # the full chunk at sub-stride intervals causes 4× overshoot.
@@ -371,14 +375,14 @@ def main():
                 else:
                     # Temporal ensembling: blend this chunk with the last action_horizon
                     # predictions.  Each overlapping prediction contributes its action for
-                    # the current timestep, weighted by exp(-ensemble_weight * age).
+                    # the current timestep, weighted by exp(-ensemble_decay * age).
                     act_history.append(chunk[: args.action_horizon])
                     num_preds = len(act_history)
                     curr_act_preds = np.stack([
                         pred_actions[i]
                         for i, pred_actions in zip(range(num_preds - 1, -1, -1), act_history)
                     ])
-                    weights = np.exp(-args.ensemble_weight * np.arange(num_preds))
+                    weights = np.exp(-args.ensemble_decay * np.arange(num_preds))
                     weights = weights / weights.sum()
                     action = np.sum(weights[:, None] * curr_act_preds, axis=0)
                     # Never ensemble the gripper — future-chunk grip predictions bleed

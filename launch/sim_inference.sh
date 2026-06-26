@@ -97,19 +97,15 @@ echo "Isaac Sim ready. Starting Octo VLA..."
 
 # XLA_PYTHON_CLIENT_PREALLOCATE=false: JAX allocates on demand instead of
 # grabbing a fixed pool (~75% of VRAM) at startup, leaving room for the RTX renderer.
-# --step-delay must match the action stride used during collection:
-#   collection --action-stride 12  →  inference --step-delay 0.2  (5 Hz, default)
-#   collection --action-stride  1  →  inference --step-delay 0.0167 (60 Hz)
-# Add --no-temporal-ensemble to see raw model output during debugging.
+#
+# Only the sim-specific routing flags are set here; everything else (window-size 2,
+# step-delay 0.2, action-horizon 4, grip-hold-steps 20, temporal-ensemble OFF) is now
+# the run_octo_live.py default. Pass overrides after "$@", e.g.:
+#   --temporal-ensemble                 enable action smoothing
+#   --step-delay 0.0167                 60 Hz (collection --action-stride 1)
 XLA_PYTHON_CLIENT_PREALLOCATE=false "$OCTO_PY" "$PROJECT_ROOT/src/vla/run_octo_live.py" \
     --ros2-camera \
-    --ros2-topic /mecheye/color \
     --ros2-output \
-    --window-size 2 \
-    --step-delay 0.2 \
-    --action-horizon 4 \
-    --no-temporal-ensemble \
-    --grip-hold-steps 20 \
     "$@" &
 PID_OCTO=$!
 
