@@ -3,10 +3,33 @@
 # pipeline.sh — Collect synthetic episodes → convert to TFDS → finetune Octo.
 #
 # Usage:
+#   bash launch/pipeline.sh --output-dir data/exp_01 --preset phased-cube
 #   bash launch/pipeline.sh --output-dir data/exp_01 --n-episodes 200
 #   bash launch/pipeline.sh --output-dir data/exp_01 --collect-only
 #   bash launch/pipeline.sh --output-dir data/exp_01 --convert-only
 #   bash launch/pipeline.sh --output-dir data/exp_01 --finetune-only
+#   bash launch/pipeline.sh --output-dir data/exp_dagger --dagger-rollouts <dir>
+#
+# --preset phased-cube  expands to the canonical collection flags
+#                       (--phased --forced-obj-sequence cube). Training defaults
+#                       (--finetune-mode full, --task-modality text_conditioned)
+#                       already match the canonical run, so nothing else is needed.
+#
+# --dagger-rollouts <dir>  DAgger mode: instead of collecting, relabel the
+#                       on-policy rollout traces in <dir> (recorded by
+#                       success_rate.py --record-dagger) with the sim oracle,
+#                       aggregate them with the expert set, then convert +
+#                       finetune.  Related flags:
+#                         --expert-raw <dir>   expert episodes merged with the
+#                                              corrective set
+#                                              (default: data/exp_truecolor2/raw)
+#                         --dagger-phase NAME  which rollout phase to relabel
+#                                              (default: pick)
+#                       NOTE: pass --pretrained-path and OOTF_PROPRIO=1 explicitly.
+#                       The DAgger finetune inherits NEITHER the base checkpoint
+#                       nor the proprio setting from the expert set, so a wrong
+#                       base silently drops proprio → an image-only model that
+#                       flails/rams in closed loop.
 #
 # All unrecognised flags (--n-episodes, --pick-x, --seed, etc.) are forwarded
 # to collect.py.  Training flags (--pretrained-path, --finetune-mode,
@@ -21,6 +44,9 @@ PHASE="all"
 COLLECT_ARGS=()
 TRAIN_ARGS=()
 HEAD_ARGS=()
+DAGGER_ROLLOUTS=""                              # set → DAgger mode: relabel+aggregate instead of collect
+EXPERT_RAW="$PROJECT_ROOT/data/exp_truecolor2/raw"   # default expert set merged with the corrective set; override with --expert-raw
+DAGGER_PHASE="pick"                             # which phase of the rollouts to relabel
 
 while [[ $# -gt 0 ]]; do
     case $1 in
@@ -30,6 +56,17 @@ while [[ $# -gt 0 ]]; do
         --finetune-only)                    PHASE="finetune";              shift   ;;
         --train-head-only)                  PHASE="train-head";            shift   ;;
         --collect-and-train-head)           PHASE="collect-train-head";    shift   ;;
+        --dagger-rollouts)                  DAGGER_ROLLOUTS="$2";          shift 2 ;;
+        --expert-raw)                       EXPERT_RAW="$2";               shift 2 ;;
+        --dagger-phase)                     DAGGER_PHASE="$2";             shift 2 ;;
+        --preset)
+            # Shorthand for a named collection/training configuration so simple
+            # runs don't have to spell out the full flag set.
+            case "$2" in
+                phased-cube)  COLLECT_ARGS+=(--phased --forced-obj-sequence cube) ;;
+                *) echo "ERROR: unknown --preset '$2' (known: phased-cube)"; exit 1 ;;
+            esac
+            shift 2 ;;
         --pretrained-path|--finetune-mode)  TRAIN_ARGS+=("$1" "$2");      shift 2 ;;
         --task-modality)                    TRAIN_ARGS+=("$1" "$2");      shift 2 ;;
         --n-finetune-steps|--batch-size)    TRAIN_ARGS+=("$1" "$2");      shift 2 ;;
@@ -83,8 +120,33 @@ detect_train_python() {
     which python3 2>/dev/null
 }
 
+# ── DAgger prep (replaces Collect when --dagger-rollouts is given) ────────────
+# Relabel on-policy rollouts with the sim oracle, then aggregate the corrective
+# episodes with the expert set into RAW_DIR — so the normal Convert+Finetune
+# below trains on D_expert ∪ D_dagger.  No Isaac/collect needed.
+if [[ -n "$DAGGER_ROLLOUTS" ]]; then
+    TRAIN_PY=$(detect_train_python)
+    [ -z "$TRAIN_PY" ] && { echo "ERROR: No Python found for DAgger relabel."; exit 1; }
+    [ -d "$DAGGER_ROLLOUTS" ] || { echo "ERROR: --dagger-rollouts dir not found: $DAGGER_ROLLOUTS"; exit 1; }
+    [ -d "$EXPERT_RAW" ]      || { echo "ERROR: --expert-raw dir not found: $EXPERT_RAW"; exit 1; }
+
+    echo "=== DAgger: relabel + aggregate ==="
+    _CORR="$OUTPUT_DIR/corrective"
+    "$TRAIN_PY" "$PROJECT_ROOT/debug/dagger_relabel.py" \
+        --rollout-dir "$DAGGER_ROLLOUTS" --out-dir "$_CORR" --phase "$DAGGER_PHASE" || exit 1
+
+    _NCORR=$(ls "$_CORR"/*.npz 2>/dev/null | wc -l)
+    [ "$_NCORR" -eq 0 ] && { echo "ERROR: relabeler produced no corrective episodes."; exit 1; }
+
+    mkdir -p "$RAW_DIR"
+    rm -f "$RAW_DIR"/*.npz
+    cp "$EXPERT_RAW"/*.npz "$RAW_DIR/"
+    cp "$_CORR"/*.npz       "$RAW_DIR/"
+    echo "  expert=$(ls "$EXPERT_RAW"/*.npz | wc -l)  corrective=$_NCORR  → aggregated $(ls "$RAW_DIR"/*.npz | wc -l) in $RAW_DIR"
+fi
+
 # ── Collect ───────────────────────────────────────────────────────────────────
-if [[ "$PHASE" == "all" || "$PHASE" == "collect" ]]; then
+if [[ ( "$PHASE" == "all" || "$PHASE" == "collect" ) && -z "$DAGGER_ROLLOUTS" ]]; then
     ISAAC_PY=$(detect_isaac_python)
     if [ -z "$ISAAC_PY" ]; then
         echo "ERROR: No Python with isaacsim found."
