@@ -24,7 +24,7 @@ Isaac Sim (headless)
   tfds_builder.py        Converts .npz → TFDS dataset  (ootf_synthetic)
        │
        ▼
-  Octo finetune          head_only mode, wrist camera, language-conditioned
+  Octo finetune          full mode (default), wrist camera, language-conditioned
        │  saves checkpoint
        ▼
   data/<exp>/checkpoint/octo_finetune/experiment_<timestamp>/
@@ -97,6 +97,8 @@ ootf_ros2/
 │       └── tfds_builder.py         .npz → TFDS dataset builder
 ├── debug/
 │   ├── debug_policy.py             Policy diagnosis script
+│   ├── success_rate.py             Closed-loop success-rate harness (+ --record-dagger)
+│   ├── dagger_relabel.py           DAgger oracle relabeler (corrective episodes)
 │   ├── test_gripper.py             Surface gripper open/close test (sim running)
 │   ├── visualize_episode.py        Plot and inspect collected .npz episodes
 │   ├── policy_diagnosis/           PNG + TXT diagnosis reports (git-ignored)
@@ -177,15 +179,58 @@ chmod +x run.sh
 
 ## Usage
 
-All modes are accessed through `run.sh`:
+All modes are accessed through `run.sh`. Run `./run.sh help` for the condensed
+quick reference, or `--help` on any underlying script for its full flag list.
 
 ```bash
 ./run.sh <mode> [args]
 ```
 
+### Modes & flags
+
+**Pipeline** — `./run.sh pipeline --output-dir <dir> [phase] [flags]`
+
+| Phase (default = full) | Effect |
+|---|---|
+| *(none)* | collect + convert + finetune |
+| `--collect-only` / `--convert-only` / `--finetune-only` | single phase |
+| `--train-head-only` / `--collect-and-train-head` | linear head instead of finetune |
+
+| Group | Flags (defaults in parens) |
+|---|---|
+| Shorthand | `--preset phased-cube` = `--phased --forced-obj-sequence cube` |
+| Collect | `--n-episodes` (200) · `--seed` · `--phased` · `--overfit` · `--gui` · `--task-type random\|sorting` · `--forced-obj-sequence OBJ…` · `--domain-rand` · `--fixed-yaw RAD` · `--instruction` |
+| Train | `--finetune-mode full\|head_only\|head_mlp_only` (**full**) · `--task-modality text_conditioned\|image_conditioned\|multimodal` (text) · `--n-finetune-steps` (50000) · `--batch-size` (32) · `--overfit` |
+| Head | `--head-model-path` · `--head-batch-size` (32) · `--lam` (1e-4) |
+| DAgger | `--dagger-rollouts <dir>` (relabel + aggregate instead of collect) · `--expert-raw <dir>` (default `data/exp_truecolor2/raw`) · `--dagger-phase` (`pick`) — see [DAgger workflow](#dagger--correcting-closed-loop-drift) |
+
+**Inference** — `./run.sh sim\|real [flags]`
+
+| Flag | Purpose |
+|---|---|
+| `--instruction "…"` / `--goal-image PNG` | task spec (mutually exclusive) |
+| `--head-path <dir>/linear_head.npz` | use linear head instead of diffusion head (recommended) |
+| `--phased` · `--phase-object cube` | phase-switching rollout |
+| `--zero-rotation` | zero the rotation dims (yaw-symmetric objects) |
+| `--temporal-ensemble` | action smoothing — **off** by default; `sim` runs raw, `real` enables it |
+| `--grip-threshold` (0.9) · `--grip-open-threshold` (0.5) · `--grip-open-steps` (3) · `--grip-hold-steps` (20) | gripper schmitt-trigger |
+
+**Debug** — `./run.sh debug <sub>`
+
+| Sub | Purpose |
+|---|---|
+| `sim` / `bridge` / `joint` / `gripper-test` | run one component in isolation |
+| `collect [--seq seq1-seq4] [--seed N]` | dry-run collector (writes nothing) |
+| `policy [--n-episodes N] [--pretrained]` | open-loop policy vs ground truth (image → action) |
+| `replay [--npz <episode.npz>]` | GT action replay through the sim (action → motion) |
+| `success [--attempts N] [--phased] …` | closed-loop success rate over N resets |
+
+**Env toggles:** `OOTF_PROPRIO=0\|1` (proprio tokenizer, default on) · `OOTF_SORT_PLATFORMS=1` (spawn sort platforms) · `OOTF_RECORD_DIR=<dir>` / `OOTF_RECORD_EVERY=N` (frame capture).
+
 ### Full pipeline — collect + convert + finetune
 ```bash
-./run.sh pipeline --output-dir data/exp_01 --n-episodes 200
+./run.sh pipeline --output-dir data/exp_01 --preset phased-cube   # canonical run
+./run.sh pipeline --output-dir data/exp_01 --n-episodes 200       # custom
 ```
 
 Run individual phases:
@@ -207,8 +252,9 @@ finetune disables augmentation/weight decay and keeps every dwell frame:
     --finetune-mode full --n-finetune-steps 20000
 ./run.sh debug policy        # open-loop: correlations ≈ 1 expected on train data
 ./run.sh debug replay        # controller-only: GT actions must track within ~2 cm
-./run.sh sim --instruction "pick up the cube and place it on the conveyor" \
-    --no-temporal-ensemble   # closed-loop replay of the memorised trajectory
+./run.sh sim --instruction "pick up the cube and place it on the conveyor"
+    # closed-loop replay of the memorised trajectory (raw chunk[0] output is the
+    # default; add --temporal-ensemble only if you want action smoothing)
 ```
 
 When running the phases separately, all three are needed and **each** needs
@@ -226,6 +272,47 @@ Fixing only `--pick-x/--pick-y/--fixed-yaw/--no-domain-rand` is **not**
 sufficient: object type, language instruction, and place position are still
 sampled per episode, giving the model several different behaviours to
 memorise under one task.
+
+### DAgger — correcting closed-loop drift
+
+The collected expert demos are optimal-state trajectories, so a finetuned policy
+drifts in closed loop (covariate shift) and misses the grasp. DAgger closes the
+gap: record the policy's *own* rollout states, relabel them with the sim oracle's
+recovery action, and finetune on the expert ∪ corrective set. Three steps:
+
+```bash
+# 1. Record on-policy rollout traces while measuring the current model
+#    (needs a running sim: ./run.sh debug sim)
+./run.sh debug success --model-path <ckpt> --phased --phase-object cube \
+    --attempts 50 --record-dagger data/exp_dagger/rollouts
+
+# 2. Relabel + aggregate + convert + finetune (no Isaac collect needed).
+#    Pass the SAME base and proprio setting as the model you are improving —
+#    the DAgger finetune inherits NEITHER automatically.
+OOTF_PROPRIO=1 ./run.sh pipeline --output-dir data/exp_dagger \
+    --dagger-rollouts data/exp_dagger/rollouts \
+    --pretrained-path <base-checkpoint> \
+    --finetune-mode full --task-modality multimodal --n-finetune-steps 50000
+
+# 3. Re-evaluate the DAgger model against the same harness
+./run.sh debug success \
+    --model-path data/exp_dagger/checkpoint/octo_finetune/experiment_<ts> \
+    --phased --phase-object cube --attempts 50
+```
+
+The relabeler (`debug/dagger_relabel.py`) only writes a gripper-close label when
+the rollout actually reached the grasp point, so corrective episodes teach the
+**approach**; the grasp demonstrations themselves come from the expert set. The
+expert set merged with the corrective episodes defaults to
+`--expert-raw data/exp_truecolor2/raw`; the relabeled phase defaults to
+`--dagger-phase pick`.
+
+> **Gotcha — proprio.** `--pretrained-path` and `OOTF_PROPRIO` are independent of
+> the expert set. Finetuning from an image-only base without `OOTF_PROPRIO=1`
+> silently produces an image-only model that flails and rams in closed loop.
+> Before trusting a DAgger run, confirm the new checkpoint's `config.json`
+> contains a `proprio` tokenizer (`grep -c proprio <ckpt>/config.json`) and that
+> inference does **not** warn `'observations' contains extra items … {'proprio'}`.
 
 ### Sim inference — Isaac Sim + Octo VLA
 ```bash
@@ -277,7 +364,7 @@ timestamp. Policy diagnosis reports (PNG plot + stats table) are saved to
 |---|---|---|
 | `max_steps` | 50,000 | ~45 passes through 200 episodes |
 | `window_size` | 2 | Consecutive frames passed to model — gives temporal context |
-| `finetuning_mode` | `head_mlp_only` | Freezes transformer + attention, trains final MLP only |
+| `finetuning_mode` | `full` (set by the pipeline CLI) | What weights train — see Finetuning modes below |
 | `batch_size` | 32 | Keep at 32; larger batches risk overfitting on small datasets |
 | `peak_value` (LR) | 3e-4 | Cosine schedule with 2000-step warmup |
 
@@ -285,9 +372,9 @@ timestamp. Policy diagnosis reports (PNG plot + stats table) are saved to
 
 | Mode | What trains | When to use |
 |---|---|---|
-| `head_mlp_only` | Final MLP layers only | **Default — preserves pretraining, teaches pick-and-place skill** |
-| `head_only` | Full action head (attention + MLP) | More capacity, risks overwriting pretrained attention |
-| `full` | Entire model | Only with very large datasets (1000+ episodes) |
+| `full` | Entire model | **Default — what the real runs use** |
+| `head_only` | Full action head (attention + MLP) | Lighter; risks overwriting pretrained attention |
+| `head_mlp_only` | Final MLP layers only | Cheapest probe; freezes transformer + attention |
 
 ### Recommended dataset size
 - Minimum: 200 episodes (below this, 95/5 train/val split may fail)
