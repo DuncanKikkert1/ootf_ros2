@@ -23,6 +23,32 @@ from task import (PickAndPlaceTask, SortingTask, Waypoint, _OBJ_PARAMS,
 
 
 # ─────────────────────────────────────────────────────────────────────────────
+# Camera capture
+# ─────────────────────────────────────────────────────────────────────────────
+
+def _capture_rgb(rgba):
+    """Convert a wrist-camera get_rgba() buffer to a true-colour uint8 RGB frame.
+
+    get_rgba() is UNSTABLE in this Isaac/scene setup — it returns EITHER:
+      • true-colour uint8 [0,255]   → use as-is, OR
+      • colour-inverted float [0,1] → a photographic negative that must be
+        inverted to recover the true scene (magenta cube, tan pallet, dark
+        gripper).  Negatives are out-of-distribution for Octo's pretrained RGB
+        backbone, so they must be fixed.
+    Verified by eye against the viewport: the uint8 path already shows a magenta
+    cube; the float path inverts to magenta (255 - green = magenta).  Distinguish
+    the two by range — a 0-255 buffer has max > 1.5.  sim_node.py uses the
+    IDENTICAL conversion so collection and eval images match.
+    """
+    if rgba is None or getattr(rgba, "ndim", 0) < 3:
+        return None
+    img = rgba[:, :, :3]
+    if img.dtype == np.uint8 or float(img.max()) > 1.5:
+        return np.clip(img, 0, 255).astype(np.uint8)          # already true colour
+    return ((1.0 - img.astype(np.float32)) * 255.0).clip(0, 255).astype(np.uint8)
+
+
+# ─────────────────────────────────────────────────────────────────────────────
 # Episode buffer
 # ─────────────────────────────────────────────────────────────────────────────
 
@@ -190,14 +216,31 @@ class DataCollector:
         from isaacsim.sensors.camera import Camera
 
         # ── Scene ─────────────────────────────────────────────────────────────
-        omni.usd.get_context().open_stage(self.scene_usd)
+        # The raw sim2.usd contains OmniGraph/ComputeGraph prims (a baked colour /
+        # Replicator graph) that DRIVE the pick-cube's colour, overriding the
+        # magenta DynamicCuboid colour set below and re-colouring/randomising it
+        # every episode.  Only disabling /World/ActionGraph (what we used to do)
+        # left other graphs running.  sim_node.py strips ALL such graphs into a
+        # cached <scene>_sim.usd; do the EXACT same here so collection and eval
+        # share one identical, graph-free scene and the cube stays a stable magenta.
+        from pathlib import Path as _Path
+        from pxr import Usd as _Usd
+        _raw_scene   = _Path(self.scene_usd)
+        _clean_scene = _raw_scene.parent / (_raw_scene.stem + "_sim.usd")
+        if (not _clean_scene.exists() or
+                _raw_scene.stat().st_mtime > _clean_scene.stat().st_mtime):
+            _s = _Usd.Stage.Open(str(_raw_scene))
+            _gpaths = [p.GetPath() for p in _s.Traverse()
+                       if p.GetTypeName() in ("OmniGraph", "ComputeGraph")]
+            for _gp in _gpaths:
+                _s.RemovePrim(_gp)
+            _s.GetRootLayer().Export(str(_clean_scene))
+            print(f"[COLLECT] Built {_clean_scene.name}: removed {len(_gpaths)} "
+                  f"graph prim(s) (was colouring the cube)", flush=True)
+        else:
+            print(f"[COLLECT] Using cached graph-free scene {_clean_scene.name}", flush=True)
+        omni.usd.get_context().open_stage(str(_clean_scene))
         stage = omni.usd.get_context().get_stage()
-
-        _ag = stage.GetPrimAtPath("/World/ActionGraph")
-        if _ag.IsValid():
-            _ag.SetActive(False)
-            if self.verbose:
-                print("[COLLECT] Disabled /World/ActionGraph", flush=True)
 
         # ── Surface gripper (Phase 1: before world.reset) ─────────────────────
         from isaacsim.core.utils.extensions import enable_extension
@@ -226,6 +269,7 @@ class DataCollector:
             position  = self.PARK_POSITIONS['cube'].copy(),
             scale     = np.array([cube_h] * 3),
             mass      = 0.20,
+            color     = np.array([1.0, 0.0, 1.0]),   # magenta — stable, unique cube cue (MUST match sim_node.py)
         ))
         cylinder = world.scene.add(DynamicCylinder(
             prim_path = self.CYLINDER_PRIM,
@@ -294,11 +338,21 @@ class DataCollector:
             print("[COLLECT] wrist_cam.initialize() ...", flush=True)
         wrist_cam.initialize()
 
-        # Auto-exposure warm-up: the first rendered frames are overexposed
-        # (frame-0 mean ~204/255 vs ~148 steady-state), polluting the first
-        # recorded step of episode 0 with an image inference never produces.
-        for _ in range(30):
+        # Auto-exposure warm-up: the first rendered frames are overexposed, so
+        # render a few before recording.  get_rgba() is dtype-UNSTABLE in this
+        # setup — sometimes float [0,1], sometimes uint8/0-255 — so the capture
+        # below normalises range; here we just warm up and log what get_rgba
+        # actually returns (dtype + range + normalised mean) for diagnosis.
+        for _ in range(40):
             world.step(render=True)
+        _r = wrist_cam.get_rgba()
+        if _r is not None and _r.ndim >= 3:
+            _f = _r[:, :, :3].astype(np.float32)
+            if float(_f.max()) > 1.5:
+                _f = _f / 255.0
+            print(f"[COLLECT] camera warm-up: get_rgba dtype={_r.dtype} "
+                  f"raw[min={float(_r.min()):.2f}, max={float(_r.max()):.2f}] "
+                  f"normalised mean={_f.mean() * 255:.1f}/255", flush=True)
 
         # PhysX TGS solver changed behaviour for velocity_iteration_count > 4.
         # /World/Pickables/Cube and /World/h2017/root_joint both exceed that limit
@@ -329,6 +383,29 @@ class DataCollector:
         )
         if self.verbose:
             print(f"[COLLECT] robot gains set (n_dof={n_dof})", flush=True)
+
+        # ── CUBE-COLOUR DIAGNOSTIC ────────────────────────────────────────────
+        # Read back the real scene colour of /World/pick_cube (displayColor + any
+        # bound material's diffuse) so we can tell whether a green cube in the
+        # saved images is a scene-colour bug or an image-capture bug.
+        try:
+            from pxr import UsdGeom as _UsdGeom, UsdShade as _UsdShade
+            _cp = stage.GetPrimAtPath(self.CUBE_PRIM)
+            _dc = _UsdGeom.Gprim(_cp).GetDisplayColorAttr().Get() if _cp.IsValid() else None
+            print(f"[CUBE-DIAG] {self.CUBE_PRIM} valid={_cp.IsValid()}  displayColor={list(_dc) if _dc else None}", flush=True)
+            if _cp.IsValid():
+                _mb = _UsdShade.MaterialBindingAPI(_cp).ComputeBoundMaterial()[0]
+                _mpath = _mb.GetPath() if _mb else None
+                print(f"[CUBE-DIAG]   bound material = {_mpath}", flush=True)
+                if _mb:
+                    _shader = _UsdShade.Shader(_mb.GetPrim().GetChild("Shader")) if _mb.GetPrim().GetChild("Shader") else None
+                    for _sp in _UsdShade.Material(_mb).GetPrim().GetChildren():
+                        for _inp in _UsdShade.Shader(_sp).GetInputs() if _UsdShade.Shader(_sp) else []:
+                            _nm = _inp.GetBaseName()
+                            if "diffuse" in _nm.lower() or "base_color" in _nm.lower() or "albedo" in _nm.lower():
+                                print(f"[CUBE-DIAG]   {_sp.GetName()}.{_nm} = {_inp.Get()}", flush=True)
+        except Exception as _e:
+            print(f"[CUBE-DIAG] readback failed: {_e}", flush=True)
 
         self._generate_lula(self.urdf_path, self.lula_desc, verbose=self.verbose)
 
@@ -368,7 +445,13 @@ class DataCollector:
                                          rep.distribution.uniform(300, 4000))
                     rep.modify.attribute("inputs:colorTemperature",
                                          rep.distribution.uniform(3200, 7500))
-                for pp in (self.CUBE_PRIM, self.CYLINDER_PRIM):
+                # Cube colour is FIXED to magenta (set on the DynamicCuboid above)
+                # so it's a stable, unique localisation cue.  Randomising it per
+                # frame over the whole RGB cube made the cube effectively
+                # colourless to the policy (different colour every image, no stable
+                # appearance) — a prime suspect for the imprecise XY localisation.
+                # Lighting is still randomised (above) for some appearance variety.
+                for pp in (self.CYLINDER_PRIM,):
                     with rep.get.prims(path_pattern=pp):
                         rep.randomizer.color(
                             colors=rep.distribution.uniform((0,0,0), (1,1,1))
@@ -608,10 +691,7 @@ class DataCollector:
                     # only after the arm has fully settled, in the GRIPPER-WAIT block.
 
                     rgba    = wrist_cam.get_rgba()
-                    cur_rgb = (
-                        (rgba[:, :, :3] * 255).clip(0, 255).astype(np.uint8)
-                        if rgba is not None and rgba.ndim >= 3 else None
-                    )
+                    cur_rgb = _capture_rgb(rgba)
 
                     # Dwell waypoint: same IK target as previous (e.g. pick contact →
                     # pick dwell).  Use 0.05 rad (≈3°) tolerance so a not-fully-settled
@@ -1066,10 +1146,15 @@ def parse_args():
     ap.add_argument("--fixed-yaw",       type=float, default=None, metavar="RAD",
                     help="Fix all episode pick-yaw to this value in radians instead of "
                          "sampling randomly. Use 0.0 for overfit/debug runs.")
-    ap.add_argument("--no-domain-rand", action="store_true",
-                    help="Disable all domain randomization: fixed lighting, fixed object "
-                         "colours, no Replicator steps. Use for overfit/debug runs where "
-                         "every episode must look identical.")
+    ap.add_argument("--domain-rand", action="store_true",
+                    help="ENABLE domain randomization (Replicator: randomised lighting + "
+                         "per-prim object colours, incl. the pyramid colour). OFF BY "
+                         "DEFAULT — the cube stays a stable, unique magenta under fixed "
+                         "lighting, which is the clean appearance we want for training. "
+                         "Turn this on only when you explicitly want appearance "
+                         "robustness. NOTE: the per-prim colour randomiser currently "
+                         "bleeds onto the cube, so enabling this re-randomises the cube "
+                         "colour every episode.")
     ap.add_argument("--phased", action="store_true",
                     help="Split each demo at the gripper transitions into separate "
                          "pick/place/home trajectories, each saved as its own episode "
@@ -1090,12 +1175,22 @@ def parse_args():
                          "type (cube/cylinder/pyramid).")
     ap.add_argument("--verbose", action="store_true",
                     help="Print diagnostic logs (gripper, IK, raycast). Off by default.")
+    ap.add_argument("--gui", action="store_true",
+                    help="Run Isaac with the viewport visible (headless OFF) so you can "
+                         "physically watch the scene/cube colour during collection. "
+                         "Slower; use for debugging only.")
     return ap.parse_args()
 
 
 def main():
     import traceback as _tb
     args = parse_args()
+
+    # Domain randomisation (Replicator lighting + per-prim object colours, incl. the
+    # pyramid) is OFF unless --domain-rand is passed.  The rest of the code still
+    # checks `no_domain_rand`, so we just derive it from the opt-in flag.  Default =
+    # no randomisation → cube stays a stable magenta under fixed lighting.
+    args.no_domain_rand = not args.domain_rand
 
     if args.overfit:
         # Pin every per-episode sampling source so all episodes are identical.
@@ -1120,7 +1215,9 @@ def main():
               f"instruction='{args.instruction}'  domain-rand=off", flush=True)
 
     from isaacsim import SimulationApp
-    simulation_app = SimulationApp({"headless": True})
+    simulation_app = SimulationApp({"headless": not args.gui})
+    if args.gui:
+        print("[COLLECT] GUI mode: viewport visible (headless OFF)", flush=True)
     _failed = False
     try:
         task_kwargs = dict(

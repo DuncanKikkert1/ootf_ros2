@@ -11,6 +11,7 @@ simulation_app = SimulationApp({"headless": False})
 
 # All imports must come after SimulationApp — Kit initialises the Python
 # environment that makes pxr, omni.*, and isaacsim.* importable.
+import os
 import time
 import numpy as np
 from scipy.spatial.transform import Rotation
@@ -48,7 +49,7 @@ ROT_EMA_ALPHA  = 1.0    # EMA smoothing for rotation (1.0 = raw model output, no
 MIN_EEF_Z_WORLD  = 0.40  # m — world-frame EEF floor; prevents arm crashing into pallet surface (~0.43 m)
 ACTION_SUBSTEPS  = 12    # physics frames per training action stride — spread each delta across all frames
 IK_FAIL_HOME_AFTER = 15  # consecutive IK failures before returning to HOME to break the frozen-scene stall
-CMD_REBASE_DIST  = 0.10  # m — re-base the command chain from actual pose when the arm diverges this far
+CMD_REBASE_DIST  = 0.20  # m — re-base the command chain from actual pose when the arm diverges this far. Raised from 0.10: steady-state PD lag at stride speed (~0.10-0.18 m, tau=0.1 s) sat at the old threshold, so the chain was discarded mid-approach and re-based onto the lagging pose — discarding the distance chaining is meant to preserve. 0.20 lets it march through normal motion lag and only re-base on genuine IK/clamp divergence.
 GRIP_SETTLE_QD   = 0.05  # rad/s — fire gripper.close() only below this joint speed (settle-then-grip)
 
 # Pickup cube — created programmatically to match collect.py exactly.
@@ -148,7 +149,44 @@ _pickup_cube = world.scene.add(DynamicCuboid(
     position  = np.array(PICKUP_POSITION),
     scale     = np.array([CUBE_HEIGHT] * 3),
     mass      = CUBE_MASS,
+    color     = np.array([1.0, 0.0, 1.0]),   # magenta — stable, unique cube cue (MUST match collect.py)
 ))
+
+# Sorting eval: recreate the SortingTask target platforms so the eval scene
+# matches the training scene (collect.py made these via _create_sort_platforms;
+# values MUST match task.py SORT_PLATFORM_CENTRES/DIMS).  Gated by env var so it
+# never affects the pick-place eval.  Static colliders, robot-arm collision
+# filtered out.  Created BEFORE world.reset() (like the cube + like collect.py).
+if os.environ.get("OOTF_SORT_PLATFORMS") == "1":
+    from pxr import UsdGeom, UsdPhysics, Gf, Sdf
+    _SORT_CENTRES = {"cube": (-0.5, -1.28, 0.855), "cylinder": (0.0, -1.28, 0.855),
+                     "pyramid": (0.5, -1.28, 0.855)}
+    _SORT_DIMS    = {"cube": (0.10, 0.10, 0.01), "cylinder": (0.10, 0.10, 0.01),
+                     "pyramid": (0.25, 0.25, 0.01)}
+    _sp_stage = omni.usd.get_context().get_stage()
+    _sp_links = ("base_link", "base", "link_1", "link_2", "link_3",
+                 "link_4", "link_5", "link_6")
+    _sp_grey  = [Gf.Vec3f(0.55, 0.55, 0.55)]
+    for _on in ("cube", "cylinder", "pyramid"):
+        _c, _d = _SORT_CENTRES[_on], _SORT_DIMS[_on]
+        _path  = f"/World/SortPlatform_{_on}"
+        if _on == "cylinder":
+            _g = UsdGeom.Cylinder.Define(_sp_stage, _path)
+            _g.GetRadiusAttr().Set(_d[0] / 2.0); _g.GetHeightAttr().Set(_d[2])
+            _g.GetAxisAttr().Set("Z")
+            _pr = _sp_stage.GetPrimAtPath(_path)
+            UsdGeom.Xformable(_pr).AddTranslateOp().Set(Gf.Vec3d(*_c))
+        else:
+            _g = UsdGeom.Cube.Define(_sp_stage, _path); _g.GetSizeAttr().Set(1.0)
+            _pr = _sp_stage.GetPrimAtPath(_path)
+            UsdGeom.Xformable(_pr).AddTranslateOp().Set(Gf.Vec3d(*_c))
+            UsdGeom.Xformable(_pr).AddScaleOp().Set(Gf.Vec3f(*_d))
+        _g.GetDisplayColorAttr().Set(_sp_grey)
+        UsdPhysics.CollisionAPI.Apply(_pr)
+        _fp = UsdPhysics.FilteredPairsAPI.Apply(_pr)
+        for _lk in _sp_links:
+            _fp.GetFilteredPairsRel().AddTarget(Sdf.Path(f"/World/h2017/{_lk}"))
+    print("[SCENE] Sort platforms created (cube/cylinder/pyramid)")
 
 world.reset()
 print(f"[ROBOT] {robot.num_dof} DOF")
@@ -168,6 +206,12 @@ if _scene_cube_prim.IsValid():
     print("[SCENE] /World/Pickables/Cube parked underground")
 print(f"[SCENE] Pickup cube ready: {PICKUP_PRIM_PATH}")
 
+# NOTE: must match collect.py's gains (1e6/1e5) — the policy is trained on
+# trajectories executed under THIS controller, so changing it at inference
+# creates a train/inference dynamics mismatch.  Stiffening to 4e6/2e5 was
+# tried (2026-06-18) and did nothing to the lag — at kp=1e6 the drives are
+# already effort-saturated against the USD default maxForce, so raising kp
+# can't make the arm track faster.  Reverted.
 robot.get_articulation_controller().set_gains(
     kps=np.full(robot.num_dof, 1e6),
     kds=np.full(robot.num_dof, 1e5),
@@ -240,14 +284,18 @@ class RobotROSNode(Node):
         self.eef_delta        = None
         self.gripper_cmd      = None   # float: >0.5 → close, ≤0.5 → open
         self.do_reset         = False
+        self.set_cube_pos     = None   # [x,y,z] world — place the pick cube here (grasp-test)
         self.create_subscription(JointState,        '/joint_command', self._joint_cb,     10)
         self.create_subscription(Float64MultiArray, '/eef_delta',     self._eef_delta_cb, 10)
         self.create_subscription(Empty,             '/reset_scene',   self._reset_cb,     1)
+        self.create_subscription(Float64MultiArray, '/set_cube_pose', self._set_cube_cb,  1)
         self.state_publisher      = self.create_publisher(JointState,        '/joint_states',   10)
         self.camera_publisher     = self.create_publisher(Image,             '/mecheye/color',   1)
         self.gripper_publisher    = self.create_publisher(String,            '/gripper_status',  1)
         self.eef_state_publisher  = self.create_publisher(Float64MultiArray, '/eef_state',      10)
         self.cube_pose_publisher  = self.create_publisher(Float64MultiArray, '/cube_pose',      10)
+        self.grasp_align_publisher = self.create_publisher(Float64MultiArray, '/grasp_align',   10)
+        self.cube_pose_rf_publisher = self.create_publisher(Float64MultiArray, '/cube_pose_rf', 10)
         self.get_logger().info("ROS2 node ready")
 
     def _joint_cb(self, msg: JointState) -> None:
@@ -262,6 +310,11 @@ class RobotROSNode(Node):
 
     def _reset_cb(self, _msg: Empty) -> None:
         self.do_reset = True
+
+    def _set_cube_cb(self, msg: Float64MultiArray) -> None:
+        """Place the pick cube at an explicit world XYZ (grasp-test, bypasses jitter)."""
+        if len(msg.data) >= 3:
+            self.set_cube_pos = [float(msg.data[0]), float(msg.data[1]), float(msg.data[2])]
 
     def publish_joint_states(self, positions, velocities, efforts):
         """Publish current joint state to /joint_states."""
@@ -318,6 +371,30 @@ _cube_watch_home = np.array(PICKUP_POSITION, dtype=float)   # cube rest position
 _cube_alarmed    = False  # one-shot: fired when the cube first leaves its spot
 _open_pending    = False  # deferred gripper open — fires once the arm settles
 _open_deadline   = 0      # frame cap so a pending open can never stall forever
+_cube_reset_pending  = False  # deferred cube reposition: wait until the gripper
+_cube_reset_pos      = None   # actually releases a latched cube before set_world_pose,
+_cube_reset_deadline = 0      # else the infinite-break-force D6 joint drags it off-spot
+
+# Optional eval-video recorder: dump the ALREADY-rendered viewport to PNGs so a
+# demo video can be made WITHOUT a screen recorder competing for GPU/VRAM (the
+# render already happened; this just reads it).  Set OOTF_RECORD_DIR=/path; encode
+# the PNGs to mp4 AFTER the run (no contention).  Falls back to the wrist-cam
+# frame if the viewport-capture API isn't available.
+_REC_DIR   = os.environ.get("OOTF_RECORD_DIR")
+_REC_EVERY = max(1, int(os.environ.get("OOTF_RECORD_EVERY", "3")))   # 60fps → ~20fps
+_rec_n     = 0
+_rec_vp    = None
+_rec_to_file = None
+if _REC_DIR:
+    os.makedirs(_REC_DIR, exist_ok=True)
+    try:
+        from omni.kit.viewport.utility import get_active_viewport, capture_viewport_to_file
+        _rec_vp = get_active_viewport()
+        _rec_to_file = capture_viewport_to_file
+        print(f"[REC] recording BOTH viewport_* (3rd-person) AND wrist_* (POV) frames "
+              f"to {_REC_DIR} (every {_REC_EVERY} steps)", flush=True)
+    except Exception as _rec_e:
+        print(f"[REC] viewport capture unavailable ({_rec_e}) — recording wrist_* (POV) frames only", flush=True)
 
 while simulation_app.is_running():
     rclpy.spin_once(ros_node, timeout_sec=0)
@@ -520,16 +597,16 @@ while simulation_app.is_running():
         if _pickup_cube is not None:
             _rx = PICKUP_POSITION[0] + np.random.uniform(-PICKUP_XY_VARIATION, PICKUP_XY_VARIATION)
             _ry = PICKUP_POSITION[1] + np.random.uniform(-PICKUP_XY_VARIATION, PICKUP_XY_VARIATION)
-            _reset_pos = np.array([_rx, _ry, PICKUP_POSITION[2]], dtype=float)
-            _pickup_cube.set_world_pose(
-                position=_reset_pos,
-                orientation=np.array(PICKUP_ORIENT_WXYZ, dtype=float),
-            )
-            _pickup_cube.set_linear_velocity(np.zeros(3))
-            _pickup_cube.set_angular_velocity(np.zeros(3))
-            _cube_watch_home = _reset_pos.copy()
-            _cube_alarmed    = False
-            print(f"[SCENE] Reset: arm→home, gripper→open, cube→{_reset_pos.round(4)}")
+            # Defer the reposition: gripper.open() above only takes effect once
+            # PhysX steps, and the D6 attachment joint has effectively infinite
+            # break force — so set_world_pose() in this same callback fights the
+            # still-active joint and a latched cube gets yanked back to the
+            # gripper ("cube doesn't reset" after a successful grasp).  Move it
+            # in the deferred block below, once the gripper reports it released.
+            _cube_reset_pos      = np.array([_rx, _ry, PICKUP_POSITION[2]], dtype=float)
+            _cube_reset_pending  = True
+            _cube_reset_deadline = _loop_count + 90
+            print(f"[SCENE] Reset: arm→home, gripper→open, cube reposition pending → {_cube_reset_pos.round(4)}")
         else:
             print(f"[SCENE] Reset requested but cube prim not found — "
                   f"set PICKUP_PRIM_PATH in sim_node.py")
@@ -539,6 +616,40 @@ while simulation_app.is_running():
     _gripped = gripper._interface.get_gripped_objects(_GRIPPER_PRIM_PATH) if gripper._interface else []
     _gs_msg.data = f"{gripper.status()}|{','.join(_gripped)}"
     ros_node.gripper_publisher.publish(_gs_msg)
+
+    # Deferred cube reposition (see reset block): only move the cube once the
+    # gripper has actually released it, so the still-active D6 joint can't drag
+    # it back off the reset spot.  Failsafe deadline forces it if the gripper
+    # never reports a clean release.
+    if _cube_reset_pending and _pickup_cube is not None:
+        _released = (gripper.status() == "open"
+                     and not any("pick_cube" in g for g in _gripped))
+        if _released or _loop_count >= _cube_reset_deadline:
+            _pickup_cube.set_world_pose(
+                position=_cube_reset_pos,
+                orientation=np.array(PICKUP_ORIENT_WXYZ, dtype=float),
+            )
+            _pickup_cube.set_linear_velocity(np.zeros(3))
+            _pickup_cube.set_angular_velocity(np.zeros(3))
+            _cube_watch_home    = _cube_reset_pos.copy()
+            _cube_alarmed       = False
+            _cube_reset_pending = False
+            _tag = "released" if _released else "DEADLINE-forced"
+            print(f"[SCENE] Cube repositioned ({_tag}) → {_cube_reset_pos.round(4)} "
+                  f"at frame {_loop_count}")
+
+    # Grasp-test: place the cube at an explicit world XYZ (debug_replay sends the
+    # cup world position so the cube sits exactly under the recorded grasp pose).
+    if ros_node.set_cube_pos is not None and _pickup_cube is not None:
+        _scp = np.array(ros_node.set_cube_pos, dtype=float)
+        ros_node.set_cube_pos = None
+        _pickup_cube.set_world_pose(position=_scp,
+                                    orientation=np.array(PICKUP_ORIENT_WXYZ, dtype=float))
+        _pickup_cube.set_linear_velocity(np.zeros(3))
+        _pickup_cube.set_angular_velocity(np.zeros(3))
+        _cube_watch_home = _scp.copy()
+        _cube_alarmed    = False
+        print(f"[SCENE] Cube placed at {_scp.round(4)} (grasp-test)")
 
     # Keep the kinematic gripper body co-located with link_6 so scan origins
     # are current and the red markers don't drift away from the physical gripper.
@@ -563,6 +674,35 @@ while simulation_app.is_running():
         _cp_msg = Float64MultiArray()
         _cp_msg.data = [float(_cp_now[0]), float(_cp_now[1]), float(_cp_now[2])]
         ros_node.cube_pose_publisher.publish(_cp_msg)
+
+        # Cube in the ROBOT/BASE frame too — same frame as /eef_state proprio and
+        # the action deltas, so the DAgger oracle can compute the corrective
+        # delta (cube_rf − proprio) without needing the base rotation.
+        _cp_rf = _sync_base_mat.T @ (np.asarray(_cp_now, float) - _sync_base_pos)
+        _cprf_msg = Float64MultiArray()
+        _cprf_msg.data = [float(_cp_rf[0]), float(_cp_rf[1]), float(_cp_rf[2])]
+        ros_node.cube_pose_rf_publisher.publish(_cprf_msg)
+
+        # Cup-vs-cube alignment for the harness's contact-gated grasp.  The
+        # harness only has eef_state in the robot frame, so it can't tell when
+        # the suction cup is actually over the cube; publish that geometry in
+        # world frame: [lateral_xy, vertical_clearance, in_range].  in_range=1
+        # means the cup centroid is within the cube footprint AND inside the
+        # suction range above the cube top — the harness stops descending and
+        # latches there, instead of bias-driving past the cube into the pallet.
+        _tips_w = [_sync_base_pos + _sync_base_mat @ (_sync_pos_rf + _sync_rot_rf @ np.asarray(_t, float))
+                   for _t in _CUP_TIPS]
+        _cup_w   = np.mean(_tips_w, axis=0)
+        _lat     = float(np.linalg.norm(_cup_w[:2] - _cp_now[:2]))
+        _vclear  = float(_cup_w[2] - (_cp_now[2] + CUBE_HEIGHT / 2.0))   # >0 = above cube top
+        _in_rng  = 1.0 if (_lat < CUBE_HEIGHT / 2.0 and -0.01 <= _vclear <= _MAX_GRIP_DISTANCE) else 0.0
+        _ga_msg  = Float64MultiArray()
+        # [lat, vclear, in_range, cupX, cupY, cupZ] — append the RAW suction-cup
+        # centroid world position so the harness can show exactly where the
+        # gripper is vs the cube (cube world pose is on /cube_pose).
+        _ga_msg.data = [_lat, _vclear, _in_rng,
+                        float(_cup_w[0]), float(_cup_w[1]), float(_cup_w[2])]
+        ros_node.grasp_align_publisher.publish(_ga_msg)
 
     # Cube-watch: report the exact frame the pickup cube first leaves its rest
     # position, with the EEF geometry and gripper state at that moment.  This
@@ -617,8 +757,47 @@ while simulation_app.is_running():
 
     rgba = camera.get_rgba()
     if rgba is not None and rgba.size > 0:
-        rgb = (rgba[:, :, :3] * 255).clip(0, 255).astype(np.uint8)
+        # get_rgba() is UNSTABLE here: returns either true-colour uint8 [0,255]
+        # (use as-is) or colour-inverted float [0,1] (invert to recover true
+        # colour).  Distinguish by range (0-255 buffer has max > 1.5).  IDENTICAL
+        # to collect.py's _capture_rgb so eval images match the training images.
+        _img = rgba[:, :, :3]
+        _as_is = _img.dtype == np.uint8 or float(_img.max()) > 1.5
+        if _as_is:
+            rgb = np.clip(_img, 0, 255).astype(np.uint8)
+        else:
+            rgb = ((1.0 - _img.astype(np.float32)) * 255.0).clip(0, 255).astype(np.uint8)
         ros_node.publish_camera(rgb)
+        # Eval-video recorder: save BOTH views per frame (already rendered → no
+        # extra GPU, no screen grabber).  viewport_* = third-person scene,
+        # wrist_* = the model's POV (what it actually sees).  Encode each prefix
+        # to its own mp4 AFTER the run.
+        if _REC_DIR and _loop_count % _REC_EVERY == 0:
+            _idx = _rec_n; _rec_n += 1
+            if _rec_vp is not None:                       # third-person viewport
+                try:
+                    _rec_to_file(_rec_vp, os.path.join(_REC_DIR, f"viewport_{_idx:06d}.png"))
+                except Exception:
+                    pass
+            try:                                          # model POV (wrist cam)
+                from PIL import Image as _PILImageR
+                _PILImageR.fromarray(rgb).save(os.path.join(_REC_DIR, f"wrist_{_idx:06d}.png"))
+            except Exception:
+                pass
+        # One-shot: log what eval actually feeds the policy + dump a frame, so we
+        # can confirm it MATCHES the (uint8, true-colour) training images.
+        if _loop_count > 90 and not getattr(ros_node, "_cam_diag_done", False):
+            ros_node._cam_diag_done = True
+            print(f"[CAM-DIAG] eval get_rgba dtype={rgba.dtype} "
+                  f"raw[min={float(rgba.min()):.2f}, max={float(rgba.max()):.2f}] "
+                  f"branch={'uint8/as-is' if _as_is else 'float/INVERTED'} "
+                  f"published mean={float(rgb.mean()):.1f}", flush=True)
+            try:
+                from PIL import Image as _PILImage
+                _PILImage.fromarray(rgb).save("/tmp/eval_frame.png")
+                print("[CAM-DIAG] saved published eval frame -> /tmp/eval_frame.png", flush=True)
+            except Exception as _e:
+                print(f"[CAM-DIAG] frame save failed: {_e}", flush=True)
 
 # -----------------------------------------------------------------------------
 # Cleanup
